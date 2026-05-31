@@ -12,6 +12,9 @@ static const int BOARD_H = 6;
 static const int HAND_SIZE = 6;
 static const uint32_t TURN_LIMIT_MS = 30000;
 static const uint32_t TITLE_MIN_SHOW_MS = 800;
+static const uint32_t BALL_STEP_ANIM_MS = 120;
+static const int TOP_INFO_Y = 14;
+static const int TOP_LABEL_Y = 3;
 
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixels(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -64,10 +67,11 @@ struct GameContext
   uint8_t serveX = 2;
   uint8_t cardCursor = 0;
   uint8_t cpuGhostCursor = 0;
-  uint8_t ballX = 2;
-  uint8_t ballY = 5;
+  int8_t ballX = 2;
+  int8_t ballY = 5;
   bool ballPlaced = false;
   uint32_t phaseStartedAt = 0;
+  uint32_t cpuActionDelayMs = 0;
   uint8_t playerGames = 0;
   uint8_t cpuGames = 0;
   uint16_t turnCount = 0;
@@ -113,6 +117,7 @@ struct FrameEffects
 };
 
 static GameContext g;
+uint32_t randomCpuDelayMs();
 
 // Stage-1 compatibility shim: move call sites to context-backed state
 // while keeping existing function bodies mostly unchanged.
@@ -127,6 +132,7 @@ static GameContext g;
 #define ballY g.ballY
 #define ballPlaced g.ballPlaced
 #define phaseStartedAt g.phaseStartedAt
+#define cpuActionDelayMs g.cpuActionDelayMs
 #define playerGames g.playerGames
 #define cpuGames g.cpuGames
 #define turnCount g.turnCount
@@ -164,28 +170,38 @@ static inline const char *dirLabel(CardDir d)
 
 void drawDirectionGlyph(CardDir dir, int x, int y)
 {
+  drawDirectionGlyphColor(dir, x, y, SSD1306_WHITE);
+}
+
+void drawDirectionGlyphColor(CardDir dir, int x, int y, uint16_t color)
+{
   // x,y is the glyph center inside a card cell.
   if (dir == STRAIGHT)
   {
-    display.drawLine(x, y + 3, x, y - 2, SSD1306_WHITE);
-    display.drawLine(x, y - 2, x - 2, y, SSD1306_WHITE);
-    display.drawLine(x, y - 2, x + 2, y, SSD1306_WHITE);
+    display.drawLine(x, y + 3, x, y - 2, color);
+    display.drawLine(x, y - 2, x - 2, y, color);
+    display.drawLine(x, y - 2, x + 2, y, color);
   }
   else if (dir == DIAG_R)
   {
-    display.drawLine(x - 2, y + 2, x + 2, y - 2, SSD1306_WHITE);
-    display.drawLine(x + 2, y - 2, x + 2, y + 1, SSD1306_WHITE);
-    display.drawLine(x + 2, y - 2, x - 1, y - 2, SSD1306_WHITE);
+    display.drawLine(x - 2, y + 2, x + 2, y - 2, color);
+    display.drawLine(x + 2, y - 2, x + 2, y + 1, color);
+    display.drawLine(x + 2, y - 2, x - 1, y - 2, color);
   }
   else
   {
-    display.drawLine(x + 2, y + 2, x - 2, y - 2, SSD1306_WHITE);
-    display.drawLine(x - 2, y - 2, x - 2, y + 1, SSD1306_WHITE);
-    display.drawLine(x - 2, y - 2, x + 1, y - 2, SSD1306_WHITE);
+    display.drawLine(x + 2, y + 2, x - 2, y - 2, color);
+    display.drawLine(x - 2, y - 2, x - 2, y + 1, color);
+    display.drawLine(x - 2, y - 2, x + 1, y - 2, color);
   }
 }
 
 void drawCardNumberGlyph(uint8_t value, int x, int y)
+{
+  drawCardNumberGlyphColor(value, x, y, SSD1306_WHITE);
+}
+
+void drawCardNumberGlyphColor(uint8_t value, int x, int y, uint16_t color)
 {
   // 3x5 seven-segment-like glyph via line primitives.
   // Segment anchors:
@@ -218,19 +234,31 @@ void drawCardNumberGlyph(uint8_t value, int x, int y)
   }
 
   if (a)
-    display.drawLine(x, y, x + 2, y, SSD1306_WHITE);
+    display.drawLine(x, y, x + 2, y, color);
   if (b)
-    display.drawLine(x + 2, y, x + 2, y + 2, SSD1306_WHITE);
+    display.drawLine(x + 2, y, x + 2, y + 2, color);
   if (c)
-    display.drawLine(x + 2, y + 2, x + 2, y + 4, SSD1306_WHITE);
+    display.drawLine(x + 2, y + 2, x + 2, y + 4, color);
   if (d)
-    display.drawLine(x, y + 4, x + 2, y + 4, SSD1306_WHITE);
+    display.drawLine(x, y + 4, x + 2, y + 4, color);
   if (e)
-    display.drawLine(x, y + 2, x, y + 4, SSD1306_WHITE);
+    display.drawLine(x, y + 2, x, y + 4, color);
   if (f)
-    display.drawLine(x, y, x, y + 2, SSD1306_WHITE);
+    display.drawLine(x, y, x, y + 2, color);
   if (g)
-    display.drawLine(x, y + 2, x + 2, y + 2, SSD1306_WHITE);
+    display.drawLine(x, y + 2, x + 2, y + 2, color);
+}
+
+void drawLastPlayedCard(const Card &c, int x, int y, bool invert)
+{
+  if (c.used)
+    return;
+  uint16_t fg = invert ? SSD1306_BLACK : SSD1306_WHITE;
+  if (invert)
+    display.fillRect(x, y, 14, 10, SSD1306_WHITE);
+  display.drawRect(x, y, 14, 10, SSD1306_WHITE);
+  drawDirectionGlyphColor(c.dir, x + 4, y + 4, fg);
+  drawCardNumberGlyphColor(c.value, x + 9, y + 3, fg);
 }
 
 void toneMs(int freq, int ms)
@@ -396,6 +424,8 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
 {
   dealHands();
   turnCount = 0;
+  lastPlayerCard.used = true;
+  lastCpuCard.used = true;
   ballPlaced = false;
   serveX = 2;
   cardCursor = 0;
@@ -408,7 +438,7 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
   emitNeo(fx, NEO_NORMAL_EVT);
 }
 
-bool applyCard(bool actorIsPlayer, const Card &c)
+bool applyCard(bool actorIsPlayer, const Card &c, bool animate = true)
 {
   int signY = actorIsPlayer ? -1 : 1;
   int dx = 0;
@@ -416,20 +446,53 @@ bool applyCard(bool actorIsPlayer, const Card &c)
     dx = actorIsPlayer ? 1 : -1;
   if (c.dir == DIAG_L)
     dx = actorIsPlayer ? -1 : 1;
-  int nx = ballX + dx * c.value;
-  int ny = ballY + signY * c.value;
-  bool out = nx < 0 || nx >= BOARD_W || ny < 0 || ny >= BOARD_H;
-  if (out)
-    return false;
-  ballX = (uint8_t)nx;
-  ballY = (uint8_t)ny;
+  bool out = false;
+  bool sideFail = false;
+
+  if (animate)
+  {
+    for (uint8_t step = 0; step < c.value; ++step)
+    {
+      int nextX = ballX + dx;
+      int nextY = ballY + signY;
+      bool nextOut = nextX < 0 || nextX >= BOARD_W || nextY < 0 || nextY >= BOARD_H;
+      ballX = (int8_t)nextX;
+      ballY = (int8_t)nextY;
+      renderGame(g, display);
+      delay(BALL_STEP_ANIM_MS);
+      if (nextOut)
+      {
+        out = true;
+        break; // Show up to one cell outside the board.
+      }
+    }
+  }
+  else
+  {
+    int nx = ballX + dx * c.value;
+    int ny = ballY + signY * c.value;
+    ballX = (int8_t)nx;
+    ballY = (int8_t)ny;
+    out = nx < 0 || nx >= BOARD_W || ny < 0 || ny >= BOARD_H;
+    if (out)
+    {
+      if (ballX < 0) ballX = -1;
+      if (ballX >= BOARD_W) ballX = BOARD_W;
+      if (ballY < 0) ballY = -1;
+      if (ballY >= BOARD_H) ballY = BOARD_H;
+    }
+  }
 
   // Must reach opponent side in one shot.
-  if (actorIsPlayer && ballY > 2)
-    return false;
-  if (!actorIsPlayer && ballY < 3)
-    return false;
-  return true;
+  if (!out)
+  {
+    if (actorIsPlayer && ballY > 2)
+      sideFail = true;
+    if (!actorIsPlayer && ballY < 3)
+      sideFail = true;
+  }
+
+  return !out && !sideFail;
 }
 
 void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx)
@@ -462,7 +525,7 @@ void startNextRoundOrMatch(uint32_t nowMs, FrameEffects &fx)
 
 void drawBoard()
 {
-  const int ox = 0, oy = 6, cellW = 8, cellH = 9;
+  const int ox = 1, oy = 6, cellW = 8, cellH = 9;
   display.drawRect(ox, oy, cellW * BOARD_W + 1, cellH * BOARD_H + 1, SSD1306_WHITE);
   for (int i = 1; i < BOARD_W; ++i)
     display.drawLine(ox + i * cellW, oy, ox + i * cellW, oy + cellH * BOARD_H, SSD1306_WHITE);
@@ -475,10 +538,10 @@ void drawBoard()
   display.drawLine(ox, yMid, ox + cellW * BOARD_W, yMid, SSD1306_WHITE);
   display.drawLine(ox, yMid + 1, ox + cellW * BOARD_W, yMid + 1, SSD1306_WHITE);
 
-  // Center vertical line: thicker than other vertical lines, but thinner than horizontal center.
+  // Center vertical line: bias thickness to the left side so visual cell widths stay even.
   int xMid = ox + cellW * 3;
+  display.drawLine(xMid - 1, oy, xMid - 1, oy + cellH * BOARD_H, SSD1306_WHITE);
   display.drawLine(xMid, oy, xMid, oy + cellH * BOARD_H, SSD1306_WHITE);
-  display.drawLine(xMid + 1, oy, xMid + 1, oy + cellH * BOARD_H, SSD1306_WHITE);
 
   if (ballPlaced)
   {
@@ -500,31 +563,24 @@ void drawBoard()
 
 void drawHand(Card hand[], bool showCursor)
 {
-  int x = 50;
-  int y = 34;
-  const int cardW = 24;
-  const int cardH = 14;
+  int x = 57;
+  int y = 40;
+  const int cardW = 11;
+  const int cardH = 18;
   const int gapX = 1;
-  const int gapY = 1;
   display.setTextSize(1);
   for (int i = 0; i < HAND_SIZE; ++i)
   {
-    int cx = x + (i % 3) * (cardW + gapX);
-    int cy = y + (i / 3) * (cardH + gapY);
+    int cx = x + i * (cardW + gapX);
+    int cy = y;
+    if (hand[i].used)
+      continue;
     display.drawRect(cx, cy, cardW, cardH, SSD1306_WHITE);
     if (showCursor && i == cardCursor)
       display.drawRect(cx - 1, cy - 1, cardW + 2, cardH + 2, SSD1306_WHITE);
-    if (hand[i].used)
-    {
-      display.setCursor(cx + 8, cy + 4);
-      display.print("X");
-    }
-    else
-    {
-      // Direction glyph + value on the right side.
-      drawDirectionGlyph(hand[i].dir, cx + 6, cy + 5);
-      drawCardNumberGlyph(hand[i].value, cx + 14, cy + 4);
-    }
+    // Vertical layout: direction on top, value below.
+    drawDirectionGlyph(hand[i].dir, cx + 5, cy + 5);
+    drawCardNumberGlyph(hand[i].value, cx + 4, cy + 12);
   }
 }
 
@@ -536,7 +592,7 @@ void drawHUD()
     uint32_t remain = 0;
     if (millis() - phaseStartedAt < TURN_LIMIT_MS)
       remain = (TURN_LIMIT_MS - (millis() - phaseStartedAt)) / 1000;
-    display.setCursor(88, 0);
+    display.setCursor(94, TOP_INFO_Y);
     display.print(remain);
     display.print("s");
   }
@@ -556,44 +612,67 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
   else if (phase == PHASE_GAME_INTRO)
   {
     display.setTextSize(1);
-    display.setCursor(44, 28);
+    display.setCursor(44, 20);
     display.print("Game");
     display.print((int)(playerGames + cpuGames + 1));
+    display.setCursor(38, 32);
+    display.print("1P ");
+    display.print(playerGames);
+    display.setCursor(72, 32);
+    display.print("CPU ");
+    display.print(cpuGames);
+    display.setCursor(46, 44);
+    display.print(playerServe ? "Serve" : "Receive");
   }
   else if (phase == PHASE_MATCH_OVER)
   {
     display.setTextSize(1);
     display.setCursor(20, 20);
     display.print(playerGames >= 3 ? "YOU WIN MATCH" : "CPU WIN MATCH");
-    display.setCursor(20, 36);
+    display.setCursor(42, 30);
+    display.print("1P ");
+    display.print(playerGames);
+    display.print(" - ");
+    display.print(cpuGames);
+    display.setCursor(20, 42);
     display.print("UP: RETRY");
   }
   else
   {
     drawHUD();
     drawBoard();
+    if (phase != PHASE_GAME_OVER)
+    {
+      drawLastPlayedCard(lastPlayerCard, 56, TOP_INFO_Y + 2, false);
+      drawLastPlayedCard(lastCpuCard, 72, TOP_INFO_Y + 2, true);
+    }
     if (phase == PHASE_SERVE_POS)
     {
-      display.setCursor(121, 0);
-      display.print("S");
+      display.setCursor(96, TOP_LABEL_Y);
+      display.print("Serve");
     }
     else if (phase == PHASE_SERVE_CARD)
     {
-      display.setCursor(121, 0);
-      display.print("S");
+      display.setCursor(96, TOP_LABEL_Y);
+      display.print("Serve");
     }
-    else
+    else if (phase == PHASE_CPU_CARD)
     {
-      display.setCursor(52, 10);
+      display.setCursor(106, TOP_LABEL_Y);
+      display.print("CPU");
     }
-    if (phase == PHASE_PLAYER_CARD)
-      display.print("YOUR CARD");
-    if (phase == PHASE_CPU_CARD)
-      display.print("CPU TURN");
+    else if (phase == PHASE_PLAYER_CARD)
+    {
+      display.setCursor(104, TOP_LABEL_Y);
+      display.print("1P");
+    }
     if (phase == PHASE_GAME_OVER)
+    {
+      display.setCursor(54, 10);
       display.print("ROUND END");
+    }
     // Keep cards visible whenever the board is visible.
-    drawHand(playerHand, phase == PHASE_SERVE_POS || phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD || phase == PHASE_CPU_CARD);
+    drawHand(playerHand, phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD || phase == PHASE_CPU_CARD);
   }
   display.display();
 }
@@ -627,6 +706,7 @@ void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
   playerTurn = false;
   phase = PHASE_CPU_CARD;
   phaseStartedAt = nowMs;
+  cpuActionDelayMs = randomCpuDelayMs();
 }
 
 void cpuPlay(uint32_t nowMs, FrameEffects &fx)
@@ -643,8 +723,8 @@ void cpuPlay(uint32_t nowMs, FrameEffects &fx)
     {
       // Pick first legal, fallback first unused.
       Card test = cpuHand[i];
-      uint8_t bx = ballX, by = ballY;
-      if (applyCard(false, test))
+      int8_t bx = ballX, by = ballY;
+      if (applyCard(false, test, false))
       {
         ballX = bx;
         ballY = by;
@@ -669,6 +749,11 @@ void cpuPlay(uint32_t nowMs, FrameEffects &fx)
   playerTurn = true;
   phase = PHASE_PLAYER_CARD;
   phaseStartedAt = nowMs;
+}
+
+uint32_t randomCpuDelayMs()
+{
+  return (uint32_t)random(10000, 20001);
 }
 
 void setup()
@@ -718,6 +803,15 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
     {
       phase = playerTurn ? PHASE_SERVE_POS : PHASE_CPU_CARD;
       phaseStartedAt = nowMs;
+      if (phase == PHASE_CPU_CARD)
+      {
+        // CPU serves first in this game: place the serve ball before card play.
+        serveX = (uint8_t)random(0, BOARD_W);
+        ballX = serveX;
+        ballY = 0;
+        ballPlaced = true;
+        cpuActionDelayMs = randomCpuDelayMs();
+      }
     }
   }
   else if (phase == PHASE_MATCH_OVER)
@@ -798,7 +892,7 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
       emitSound(fx, SFX_MISS_EVT);
     }
     cpuGhostCursor = (cpuGhostCursor + 1) % HAND_SIZE;
-    if (nowMs - phaseStartedAt > 700)
+    if (nowMs - phaseStartedAt >= cpuActionDelayMs)
       cpuPlay(nowMs, fx);
     if (nowMs - phaseStartedAt >= TURN_LIMIT_MS)
     {
