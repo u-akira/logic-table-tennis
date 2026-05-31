@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = ".arduino-build/logic-table-tennis.ino.bin"
+elf = ".arduino-build/logic-table-tennis.ino.elf"
