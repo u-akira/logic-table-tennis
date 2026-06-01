@@ -525,18 +525,18 @@ void startNextRoundOrMatch(uint32_t nowMs, FrameEffects &fx)
 
 void drawBoard()
 {
-  const int ox = 1, oy = 6, cellW = 8, cellH = 9;
+  const int ox = 3, oy = 6, cellW = 8, cellH = 9;
   display.drawRect(ox, oy, cellW * BOARD_W + 1, cellH * BOARD_H + 1, SSD1306_WHITE);
   for (int i = 1; i < BOARD_W; ++i)
     display.drawLine(ox + i * cellW, oy, ox + i * cellW, oy + cellH * BOARD_H, SSD1306_WHITE);
   for (int i = 1; i < BOARD_H; ++i)
     display.drawLine(ox, oy + i * cellH, ox + cellW * BOARD_W, oy + i * cellH, SSD1306_WHITE);
 
-  // Center horizontal line: thicker than other grid lines.
+  // Center horizontal line (net): thicker and slightly overhangs outside frame.
   int yMid = oy + cellH * 3;
-  display.drawLine(ox, yMid - 1, ox + cellW * BOARD_W, yMid - 1, SSD1306_WHITE);
-  display.drawLine(ox, yMid, ox + cellW * BOARD_W, yMid, SSD1306_WHITE);
-  display.drawLine(ox, yMid + 1, ox + cellW * BOARD_W, yMid + 1, SSD1306_WHITE);
+  display.drawLine(ox - 3, yMid - 1, ox + cellW * BOARD_W + 3, yMid - 1, SSD1306_WHITE);
+  display.drawLine(ox - 3, yMid, ox + cellW * BOARD_W + 3, yMid, SSD1306_WHITE);
+  display.drawLine(ox - 3, yMid + 1, ox + cellW * BOARD_W + 3, yMid + 1, SSD1306_WHITE);
 
   // Center vertical line: bias thickness to the left side so visual cell widths stay even.
   int xMid = ox + cellW * 3;
@@ -547,6 +547,15 @@ void drawBoard()
   {
     int cx = ox + ballX * cellW + (cellW / 2);
     int cy = oy + ballY * cellH + (cellH / 2);
+    // Keep out-of-board ball visible at the nearest edge.
+    if (ballX < 0)
+      cx = ox - 2;
+    else if (ballX >= BOARD_W)
+      cx = ox + cellW * BOARD_W + 2;
+    if (ballY < 0)
+      cy = oy - 2;
+    else if (ballY >= BOARD_H)
+      cy = oy + cellH * BOARD_H + 2;
     display.fillCircle(cx, cy, 2, SSD1306_WHITE);
   }
   if (phase == PHASE_SERVE_POS)
@@ -615,12 +624,12 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     display.setCursor(44, 20);
     display.print("Game");
     display.print((int)(playerGames + cpuGames + 1));
-    display.setCursor(38, 32);
+    display.setCursor(24, 32);
     display.print("1P ");
     display.print(playerGames);
-    display.setCursor(72, 32);
-    display.print("CPU ");
+    display.print(" - ");
     display.print(cpuGames);
+    display.print(" CPU");
     display.setCursor(46, 44);
     display.print(playerServe ? "Serve" : "Receive");
   }
@@ -629,11 +638,12 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     display.setTextSize(1);
     display.setCursor(20, 20);
     display.print(playerGames >= 3 ? "YOU WIN MATCH" : "CPU WIN MATCH");
-    display.setCursor(42, 30);
+    display.setCursor(24, 30);
     display.print("1P ");
     display.print(playerGames);
     display.print(" - ");
     display.print(cpuGames);
+    display.print(" CPU");
     display.setCursor(20, 42);
     display.print("UP: RETRY");
   }
