@@ -3,6 +3,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include "config.h"
 
 static const int SCREEN_W = 128;
@@ -35,6 +38,7 @@ struct Card
 enum Phase
 {
   PHASE_TITLE,
+  PHASE_2P_WAIT,
   PHASE_GAME_INTRO,
   PHASE_SERVE_POS,
   PHASE_SERVE_CARD,
@@ -43,6 +47,14 @@ enum Phase
   PHASE_GAME_OVER,
   PHASE_MATCH_OVER
 };
+
+enum GameMode
+{
+  MODE_CPU,
+  MODE_2P
+};
+
+struct TwoPMessage;
 
 struct ButtonState
 {
@@ -75,6 +87,21 @@ struct GameContext
   uint8_t playerGames = 0;
   uint8_t cpuGames = 0;
   uint16_t turnCount = 0;
+  GameMode gameMode = MODE_CPU;
+  uint8_t titleCursor = 0;
+  uint8_t localSeat = 0;
+  uint8_t serverSeat = 0;
+  uint8_t turnSeat = 0;
+  bool twoPNetReady = false;
+  bool twoPConnected = false;
+  bool twoPSessionActive = false;
+  bool twoPLeader = false;
+  uint32_t twoPSessionSeed = 0;
+  uint32_t twoPLocalNonce = 0;
+  uint32_t twoPLastHelloAt = 0;
+  uint32_t twoPLastStartAt = 0;
+  uint8_t twoPPeerMac[6] = {0, 0, 0, 0, 0, 0};
+  uint32_t twoPPeerNonce = 0;
   Card lastPlayerCard{STRAIGHT, 0, true};
   Card lastCpuCard{STRAIGHT, 0, true};
   Card playerHand[HAND_SIZE];
@@ -136,6 +163,21 @@ uint32_t randomCpuDelayMs();
 #define playerGames g.playerGames
 #define cpuGames g.cpuGames
 #define turnCount g.turnCount
+#define gameMode g.gameMode
+#define titleCursor g.titleCursor
+#define localSeat g.localSeat
+#define serverSeat g.serverSeat
+#define turnSeat g.turnSeat
+#define twoPNetReady g.twoPNetReady
+#define twoPConnected g.twoPConnected
+#define twoPSessionActive g.twoPSessionActive
+#define twoPLeader g.twoPLeader
+#define twoPSessionSeed g.twoPSessionSeed
+#define twoPLocalNonce g.twoPLocalNonce
+#define twoPLastHelloAt g.twoPLastHelloAt
+#define twoPLastStartAt g.twoPLastStartAt
+#define twoPPeerMac g.twoPPeerMac
+#define twoPPeerNonce g.twoPPeerNonce
 #define lastPlayerCard g.lastPlayerCard
 #define lastCpuCard g.lastCpuCard
 #define playerHand g.playerHand
@@ -276,6 +318,12 @@ void sfxConfirm()
   delay(10);
   toneMs(1700, 55);
 }
+void sfxAttack()
+{
+  toneMs(1800, 25);
+  delay(5);
+  toneMs(2200, 35);
+}
 void sfxWin()
 {
   toneMs(1200, 80);
@@ -379,6 +427,77 @@ InputState readInputState()
   return in;
 }
 
+static const uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+enum TwoPMsgType : uint8_t
+{
+  TWO_P_HELLO = 1,
+  TWO_P_START = 2,
+  TWO_P_ACK = 3,
+  TWO_P_SERVE_POS = 4,
+  TWO_P_CARD = 5
+};
+
+struct __attribute__((packed)) TwoPMessage
+{
+  uint8_t type;
+  uint8_t seatId;
+  uint8_t serverId;
+  uint8_t turnId;
+  uint16_t turnIndex;
+  uint32_t seed;
+  uint32_t nonce;
+  uint8_t servePos;
+  uint8_t dir;
+  uint8_t value;
+  uint8_t reserved;
+};
+
+static volatile bool gTwoPPacketReady = false;
+static TwoPMessage gTwoPPacket;
+static uint8_t gTwoPPacketMac[6] = {0, 0, 0, 0, 0, 0};
+
+bool sameMac(const uint8_t *a, const uint8_t *b)
+{
+  for (int i = 0; i < 6; ++i)
+  {
+    if (a[i] != b[i])
+      return false;
+  }
+  return true;
+}
+
+bool macLess(const uint8_t *a, const uint8_t *b)
+{
+  for (int i = 0; i < 6; ++i)
+  {
+    if (a[i] != b[i])
+      return a[i] < b[i];
+  }
+  return false;
+}
+
+void syncTwoPViewState()
+{
+  if (gameMode != MODE_2P)
+    return;
+  playerServe = (localSeat == serverSeat);
+  playerTurn = (localSeat == turnSeat);
+}
+
+int findMatchingCardIndex(Card hand[], const Card &c)
+{
+  for (int i = 0; i < HAND_SIZE; ++i)
+  {
+    if (!hand[i].used && hand[i].dir == c.dir && hand[i].value == c.value)
+      return i;
+  }
+  return -1;
+}
+
+bool applyCard(bool actorIsPlayer, const Card &c, bool animate = true);
+void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx);
+
 bool hasUsableCard(Card hand[])
 {
   for (int i = 0; i < HAND_SIZE; ++i)
@@ -399,29 +518,316 @@ int firstUsableIndex(Card hand[])
   return -1;
 }
 
-void dealHands()
+bool hasServeValue(Card hand[])
 {
-  int order[15];
-  for (int i = 0; i < 15; ++i)
-    order[i] = i;
-  for (int i = 14; i > 0; --i)
-  {
-    int j = random(i + 1);
-    int t = order[i];
-    order[i] = order[j];
-    order[j] = t;
-  }
   for (int i = 0; i < HAND_SIZE; ++i)
   {
-    playerHand[i] = kDeck[order[i]];
-    cpuHand[i] = kDeck[order[i + HAND_SIZE]];
-    playerHand[i].used = false;
-    cpuHand[i].used = false;
+    if (hand[i].value >= 3)
+      return true;
   }
+  return false;
+}
+
+void dealHands()
+{
+  while (true)
+  {
+    int order[15];
+    for (int i = 0; i < 15; ++i)
+      order[i] = i;
+    for (int i = 14; i > 0; --i)
+    {
+      int j = random(i + 1);
+      int t = order[i];
+      order[i] = order[j];
+      order[j] = t;
+    }
+    for (int i = 0; i < HAND_SIZE; ++i)
+    {
+      Card seat0 = kDeck[order[i]];
+      Card seat1 = kDeck[order[i + HAND_SIZE]];
+      if (gameMode == MODE_2P && localSeat == 1)
+      {
+        playerHand[i] = seat1;
+        cpuHand[i] = seat0;
+      }
+      else
+      {
+        playerHand[i] = seat0;
+        cpuHand[i] = seat1;
+      }
+      playerHand[i].used = false;
+      cpuHand[i].used = false;
+    }
+
+    Card *serveHand = playerServe ? playerHand : cpuHand;
+    if (hasServeValue(serveHand))
+      return;
+  }
+}
+
+void twoPSendMessage(const uint8_t *mac, const TwoPMessage &msg)
+{
+  if (!twoPNetReady)
+    return;
+  esp_now_send(mac, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
+}
+
+void twoPEnsurePeer(const uint8_t *mac)
+{
+  if (esp_now_is_peer_exist(mac))
+    return;
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = 1;
+  peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
+  esp_now_add_peer(&peerInfo);
+}
+
+void twoPStartSession(uint32_t nowMs, FrameEffects &fx)
+{
+  if (twoPSessionActive)
+    return;
+  twoPSessionActive = true;
+  gameMode = MODE_2P;
+  syncTwoPViewState();
+  randomSeed(twoPSessionSeed);
+  resetGame(true, nowMs, fx);
+}
+
+void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs, FrameEffects &fx)
+{
+  if (msg.type == TWO_P_HELLO)
+  {
+    memcpy(twoPPeerMac, mac, 6);
+    twoPPeerNonce = msg.nonce;
+    twoPConnected = true;
+    twoPEnsurePeer(mac);
+    uint8_t localMac[6];
+    WiFi.macAddress(localMac);
+    localSeat = macLess(localMac, twoPPeerMac) ? 0 : 1;
+    twoPLeader = macLess(localMac, twoPPeerMac);
+    syncTwoPViewState();
+    return;
+  }
+
+  if (msg.type == TWO_P_START)
+  {
+    serverSeat = msg.serverId;
+    turnSeat = msg.turnId;
+    twoPSessionSeed = msg.seed;
+    twoPConnected = true;
+    twoPEnsurePeer(mac);
+    syncTwoPViewState();
+    twoPStartSession(nowMs, fx);
+    TwoPMessage ackMsg = {};
+    ackMsg.type = TWO_P_ACK;
+    ackMsg.seed = twoPSessionSeed;
+    twoPSendMessage(twoPPeerMac, ackMsg);
+    return;
+  }
+
+  if (msg.type == TWO_P_ACK)
+  {
+    twoPConnected = true;
+    twoPStartSession(nowMs, fx);
+    return;
+  }
+
+  if (!twoPSessionActive || !twoPConnected)
+    return;
+
+  if (msg.type == TWO_P_SERVE_POS)
+  {
+    if (msg.turnIndex != turnCount)
+      return;
+    serveX = msg.servePos;
+    ballX = serveX;
+    ballY = playerServe ? 5 : 0;
+    ballPlaced = true;
+    phase = PHASE_CPU_CARD;
+    phaseStartedAt = nowMs;
+    return;
+  }
+
+  if (msg.type == TWO_P_CARD)
+  {
+    if (msg.turnIndex != turnCount)
+      return;
+    Card c{(CardDir)msg.dir, msg.value, false};
+    int idx = findMatchingCardIndex(cpuHand, c);
+    if (idx < 0)
+      idx = firstUsableIndex(cpuHand);
+    if (idx < 0)
+      return;
+    cpuHand[idx].used = true;
+    lastCpuCard = c;
+    bool ok = applyCard(false, c);
+    if (!ok)
+    {
+      emitSound(fx, SFX_MISS_EVT);
+      awardRound(true, nowMs, fx);
+      return;
+    }
+    turnCount++;
+    turnSeat ^= 1;
+    syncTwoPViewState();
+    playerTurn = true;
+    phase = PHASE_PLAYER_CARD;
+    phaseStartedAt = nowMs;
+  }
+}
+
+void twoPProcessNetwork(uint32_t nowMs, FrameEffects &fx)
+{
+  if (!twoPNetReady)
+    return;
+
+  while (gTwoPPacketReady)
+  {
+    noInterrupts();
+    TwoPMessage msg = gTwoPPacket;
+    uint8_t mac[6];
+    memcpy(mac, gTwoPPacketMac, 6);
+    gTwoPPacketReady = false;
+    interrupts();
+    twoPHandlePacket(mac, msg, nowMs, fx);
+  }
+
+  if (phase != PHASE_2P_WAIT && !twoPSessionActive)
+    return;
+
+  if (nowMs - twoPLastHelloAt >= 400)
+  {
+    TwoPMessage hello = {};
+    hello.type = TWO_P_HELLO;
+    hello.nonce = twoPLocalNonce;
+    hello.seatId = localSeat;
+    twoPSendMessage(kBroadcastMac, hello);
+    twoPLastHelloAt = nowMs;
+  }
+
+  if (twoPConnected && !twoPSessionActive && twoPLeader && nowMs - twoPLastStartAt >= 600)
+  {
+    if (twoPSessionSeed == 0)
+    {
+      twoPSessionSeed = esp_random();
+      serverSeat = (twoPSessionSeed & 1) ? 1 : 0;
+      turnSeat = serverSeat;
+      syncTwoPViewState();
+    }
+    TwoPMessage startMsg = {};
+    startMsg.type = TWO_P_START;
+    startMsg.seatId = localSeat;
+    startMsg.serverId = serverSeat;
+    startMsg.turnId = turnSeat;
+    startMsg.seed = twoPSessionSeed;
+    twoPSendMessage(twoPPeerMac, startMsg);
+    twoPLastStartAt = nowMs;
+  }
+}
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+static void twoPOnReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+#else
+static void twoPOnReceive(const uint8_t *mac, const uint8_t *data, int len)
+#endif
+{
+  if (len != (int)sizeof(TwoPMessage))
+    return;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  memcpy(gTwoPPacketMac, info->src_addr, 6);
+#else
+  memcpy(gTwoPPacketMac, mac, 6);
+#endif
+  memcpy((void *)&gTwoPPacket, data, sizeof(TwoPMessage));
+  gTwoPPacketReady = true;
+}
+
+void twoPInitNetwork(uint32_t nowMs)
+{
+  if (twoPNetReady)
+    return;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  WiFi.setSleep(false);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK)
+    return;
+
+  esp_now_register_recv_cb(twoPOnReceive);
+
+  esp_now_peer_info_t broadcastPeer = {};
+  memcpy(broadcastPeer.peer_addr, kBroadcastMac, 6);
+  broadcastPeer.channel = 1;
+  broadcastPeer.encrypt = false;
+  broadcastPeer.ifidx = WIFI_IF_STA;
+  esp_now_add_peer(&broadcastPeer);
+
+  twoPLocalNonce = esp_random();
+  twoPLastHelloAt = nowMs;
+  twoPLastStartAt = 0;
+  localSeat = 0;
+  serverSeat = 0;
+  turnSeat = 0;
+  twoPConnected = false;
+  twoPSessionActive = false;
+  twoPLeader = false;
+  twoPSessionSeed = 0;
+  twoPPeerNonce = 0;
+  memset(twoPPeerMac, 0, sizeof(twoPPeerMac));
+  gTwoPPacketReady = false;
+  twoPNetReady = true;
+}
+
+void twoPShutdownNetwork()
+{
+  if (!twoPNetReady)
+    return;
+  esp_now_deinit();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  twoPNetReady = false;
+  twoPConnected = false;
+  twoPSessionActive = false;
+  twoPLeader = false;
+}
+
+void twoPSendServePos(uint8_t sx)
+{
+  if (!twoPNetReady || !twoPConnected || !twoPSessionActive)
+    return;
+  TwoPMessage msg = {};
+  msg.type = TWO_P_SERVE_POS;
+  msg.turnIndex = turnCount;
+  msg.servePos = sx;
+  twoPSendMessage(twoPPeerMac, msg);
+}
+
+void twoPSendCard(const Card &c)
+{
+  if (!twoPNetReady || !twoPConnected || !twoPSessionActive)
+    return;
+  TwoPMessage msg = {};
+  msg.type = TWO_P_CARD;
+  msg.turnIndex = turnCount;
+  msg.dir = (uint8_t)c.dir;
+  msg.value = c.value;
+  twoPSendMessage(twoPPeerMac, msg);
 }
 
 void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
 {
+  if (gameMode == MODE_2P)
+  {
+    syncTwoPViewState();
+  }
+  else if (!keepServer)
+    playerServe = random(2) == 0;
   dealHands();
   turnCount = 0;
   lastPlayerCard.used = true;
@@ -430,15 +836,21 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
   serveX = 2;
   cardCursor = 0;
   cpuGhostCursor = 0;
-  if (!keepServer)
-    playerServe = random(2) == 0;
-  playerTurn = playerServe;
+  if (gameMode == MODE_2P)
+  {
+    turnSeat = serverSeat;
+    syncTwoPViewState();
+  }
+  else
+  {
+    playerTurn = playerServe;
+  }
   phase = PHASE_GAME_INTRO;
   phaseStartedAt = nowMs;
   emitNeo(fx, NEO_NORMAL_EVT);
 }
 
-bool applyCard(bool actorIsPlayer, const Card &c, bool animate = true)
+bool applyCard(bool actorIsPlayer, const Card &c, bool animate)
 {
   int signY = actorIsPlayer ? -1 : 1;
   int dx = 0;
@@ -519,7 +931,15 @@ void startNextRoundOrMatch(uint32_t nowMs, FrameEffects &fx)
     phase = PHASE_MATCH_OVER;
     return;
   }
-  playerServe = !playerServe;
+  if (gameMode == MODE_2P)
+  {
+    serverSeat ^= 1;
+    syncTwoPViewState();
+  }
+  else
+  {
+    playerServe = !playerServe;
+  }
   resetGame(true, nowMs, fx);
 }
 
@@ -615,8 +1035,20 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     display.setTextSize(1);
     display.setCursor(8, 20);
     display.print(" Logic Table Tennis");
-    display.setCursor(28, 36);
-    display.print(" press any button");
+    display.setCursor(31, 38);
+    display.print(titleCursor == 0 ? ">CPU" : " CPU");
+    display.setCursor(73, 38);
+    display.print(titleCursor == 1 ? ">2P" : " 2P");
+  }
+  else if (phase == PHASE_2P_WAIT)
+  {
+    display.setTextSize(1);
+    display.setCursor(18, 18);
+    display.print("2P CONNECTING");
+    display.setCursor(18, 30);
+    display.print(twoPConnected ? "PEER FOUND" : "SEARCHING...");
+    display.setCursor(18, 44);
+    display.print(twoPSessionActive ? "READY" : "WAITING");
   }
   else if (phase == PHASE_GAME_INTRO)
   {
@@ -629,7 +1061,7 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     display.print(playerGames);
     display.print(" - ");
     display.print(cpuGames);
-    display.print(" CPU");
+    display.print(gameMode == MODE_CPU ? " CPU" : " 2P");
     display.setCursor(46, 44);
     display.print(playerServe ? "Serve" : "Receive");
   }
@@ -637,13 +1069,16 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
   {
     display.setTextSize(1);
     display.setCursor(20, 20);
-    display.print(playerGames >= 3 ? "YOU WIN MATCH" : "CPU WIN MATCH");
+    if (playerGames >= 3)
+      display.print("YOU WIN MATCH");
+    else
+      display.print(gameMode == MODE_CPU ? "CPU WIN MATCH" : "2P WIN MATCH");
     display.setCursor(24, 30);
     display.print("1P ");
     display.print(playerGames);
     display.print(" - ");
     display.print(cpuGames);
-    display.print(" CPU");
+    display.print(gameMode == MODE_CPU ? " CPU" : " 2P");
     display.setCursor(20, 42);
     display.print("UP: RETRY");
   }
@@ -669,7 +1104,7 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     else if (phase == PHASE_CPU_CARD)
     {
       display.setCursor(106, TOP_LABEL_Y);
-      display.print("CPU");
+      display.print(gameMode == MODE_CPU ? "CPU" : "2P");
     }
     else if (phase == PHASE_PLAYER_CARD)
     {
@@ -704,6 +1139,8 @@ void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
   Card c = playerHand[cardCursor];
   playerHand[cardCursor].used = true;
   lastPlayerCard = c;
+  twoPSendCard(c);
+  sfxAttack();
   bool ok = applyCard(true, c);
   if (!ok)
   {
@@ -713,7 +1150,15 @@ void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
   }
   emitSound(fx, SFX_CONFIRM_EVT);
   turnCount++;
-  playerTurn = false;
+  if (gameMode == MODE_2P)
+  {
+    turnSeat ^= 1;
+    syncTwoPViewState();
+  }
+  else
+  {
+    playerTurn = false;
+  }
   phase = PHASE_CPU_CARD;
   phaseStartedAt = nowMs;
   cpuActionDelayMs = randomCpuDelayMs();
@@ -756,7 +1201,15 @@ void cpuPlay(uint32_t nowMs, FrameEffects &fx)
     return;
   }
   turnCount++;
-  playerTurn = true;
+  if (gameMode == MODE_2P)
+  {
+    turnSeat ^= 1;
+    syncTwoPViewState();
+  }
+  else
+  {
+    playerTurn = true;
+  }
   phase = PHASE_PLAYER_CARD;
   phaseStartedAt = nowMs;
 }
@@ -795,16 +1248,39 @@ void setup()
 FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
 {
   FrameEffects fx;
+  if (gameMode == MODE_2P)
+    twoPProcessNetwork(nowMs, fx);
   if (phase == PHASE_TITLE)
   {
-    bool anyPressed = in.upPressed || in.downPressed || in.leftPressed || in.rightPressed;
-    bool anyHeld = in.upHeld || in.downHeld || in.leftHeld || in.rightHeld;
-    if ((anyPressed || anyHeld) && (nowMs - bootAtMs >= TITLE_MIN_SHOW_MS))
+    if (in.leftPressed)
+    {
+      if (titleCursor != 0)
+        emitSound(fx, SFX_CLICK_EVT);
+      titleCursor = 0;
+    }
+    if (in.rightPressed)
+    {
+      if (titleCursor != 1)
+        emitSound(fx, SFX_CLICK_EVT);
+      titleCursor = 1;
+    }
+    if (in.upPressed && (nowMs - bootAtMs >= TITLE_MIN_SHOW_MS))
     {
       playerGames = 0;
       cpuGames = 0;
-      resetGame(false, nowMs, fx);
-      emitSound(fx, SFX_CONFIRM_EVT);
+      gameMode = titleCursor == 0 ? MODE_CPU : MODE_2P;
+      if (gameMode == MODE_CPU)
+      {
+        resetGame(false, nowMs, fx);
+        emitSound(fx, SFX_CONFIRM_EVT);
+      }
+      else
+      {
+        twoPInitNetwork(nowMs);
+        phase = PHASE_2P_WAIT;
+        phaseStartedAt = nowMs;
+        emitSound(fx, SFX_CONFIRM_EVT);
+      }
     }
   }
   else if (phase == PHASE_GAME_INTRO)
@@ -828,6 +1304,8 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
   {
     if (in.upPressed)
     {
+      if (gameMode == MODE_2P)
+        twoPShutdownNetwork();
       phase = PHASE_TITLE;
       emitNeo(fx, NEO_NORMAL_EVT);
       emitSound(fx, SFX_CONFIRM_EVT);
@@ -850,6 +1328,7 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
       ballX = serveX;
       ballY = playerServe ? 5 : 0;
       ballPlaced = true;
+      twoPSendServePos(serveX);
       phase = PHASE_SERVE_CARD;
       cardCursor = firstUsableIndex(playerHand);
       if ((int)cardCursor < 0)
@@ -885,6 +1364,22 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
   }
   else if (phase == PHASE_CPU_CARD)
   {
+    if (gameMode == MODE_2P)
+    {
+      if (in.leftPressed)
+      {
+        moveCursorLR(-1, playerHand);
+        emitSound(fx, SFX_CLICK_EVT);
+      }
+      if (in.rightPressed)
+      {
+        moveCursorLR(1, playerHand);
+        emitSound(fx, SFX_CLICK_EVT);
+      }
+      if (in.upPressed)
+        emitSound(fx, SFX_MISS_EVT);
+      return fx;
+    }
     // During opponent selection, allow card cursor movement but disable confirm.
     if (in.leftPressed)
     {
