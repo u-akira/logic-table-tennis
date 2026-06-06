@@ -317,6 +317,48 @@ static CardDir viewCardDir(CardDir dir)
   return dir;
 }
 
+static const int BOARD_OX = 3;
+static const int BOARD_OY = 6;
+static const int BOARD_CELL_W = 8;
+static const int BOARD_CELL_H = 9;
+
+static void drawPreviewDot(int cx, int cy)
+{
+  // Keep the hint smaller than the actual ball.
+  display.fillCircle(cx, cy, 1, SSD1306_WHITE);
+}
+
+static void drawCardTargetPreview(bool actorIsPlayer, const Card &c)
+{
+  if (!ballPlaced || c.used)
+    return;
+
+  int signY = actorIsPlayer ? -1 : 1;
+  int dx = 0;
+  if (c.dir == DIAG_R)
+    dx = actorIsPlayer ? 1 : -1;
+  if (c.dir == DIAG_L)
+    dx = actorIsPlayer ? -1 : 1;
+
+  int nx = ballX + dx * c.value;
+  int ny = ballY + signY * c.value;
+
+  int cx = BOARD_OX + viewBoardX(nx) * BOARD_CELL_W + (BOARD_CELL_W / 2);
+  int cy = BOARD_OY + viewBoardY(ny) * BOARD_CELL_H + (BOARD_CELL_H / 2);
+
+  // Keep out-of-board preview visible at the nearest edge.
+  if (nx < 0)
+    cx = useMirroredTwoPView() ? BOARD_OX + BOARD_CELL_W * BOARD_W + 2 : BOARD_OX - 2;
+  else if (nx >= BOARD_W)
+    cx = useMirroredTwoPView() ? BOARD_OX - 2 : BOARD_OX + BOARD_CELL_W * BOARD_W + 2;
+  if (ny < 0)
+    cy = useMirroredTwoPView() ? BOARD_OY + BOARD_CELL_H * BOARD_H + 2 : BOARD_OY - 2;
+  else if (ny >= BOARD_H)
+    cy = useMirroredTwoPView() ? BOARD_OY - 2 : BOARD_OY + BOARD_CELL_H * BOARD_H + 2;
+
+  drawPreviewDot(cx, cy);
+}
+
 void drawLastPlayedCard(const Card &c, int x, int y, bool invert)
 {
   if (c.used)
@@ -988,7 +1030,7 @@ void startNextRoundOrMatch(uint32_t nowMs, FrameEffects &fx)
 
 void drawBoard()
 {
-  const int ox = 3, oy = 6, cellW = 8, cellH = 9;
+  const int ox = BOARD_OX, oy = BOARD_OY, cellW = BOARD_CELL_W, cellH = BOARD_CELL_H;
   display.drawRect(ox, oy, cellW * BOARD_W + 1, cellH * BOARD_H + 1, SSD1306_WHITE);
   for (int i = 1; i < BOARD_W; ++i)
     display.drawLine(ox + i * cellW, oy, ox + i * cellW, oy + cellH * BOARD_H, SSD1306_WHITE);
@@ -1021,6 +1063,12 @@ void drawBoard()
       cy = useMirroredTwoPView() ? oy - 2 : oy + cellH * BOARD_H + 2;
     display.fillCircle(cx, cy, 2, SSD1306_WHITE);
   }
+
+  if (phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD)
+  {
+    drawCardTargetPreview(true, playerHand[cardCursor]);
+  }
+
   if (phase == PHASE_SERVE_POS)
   {
     int sx = ox + viewBoardX(serveX) * cellW;
@@ -1184,6 +1232,9 @@ void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
   lastPlayerCard = c;
   twoPSendCard(c);
   sfxAttack();
+  // Clear the preview before the real ball motion starts.
+  renderGame(g, display);
+  display.display();
   bool ok = applyCard(true, c);
   if (!ok)
   {
