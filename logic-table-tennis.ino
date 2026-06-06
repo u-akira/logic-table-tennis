@@ -291,6 +291,32 @@ void drawCardNumberGlyphColor(uint8_t value, int x, int y, uint16_t color)
     display.drawLine(x, y + 2, x + 2, y + 2, color);
 }
 
+static bool useMirroredTwoPView()
+{
+  return gameMode == MODE_2P && localSeat == 1;
+}
+
+static int viewBoardX(int x)
+{
+  return useMirroredTwoPView() ? (BOARD_W - 1 - x) : x;
+}
+
+static int viewBoardY(int y)
+{
+  return useMirroredTwoPView() ? (BOARD_H - 1 - y) : y;
+}
+
+static CardDir viewCardDir(CardDir dir)
+{
+  if (!useMirroredTwoPView())
+    return dir;
+  if (dir == DIAG_R)
+    return DIAG_L;
+  if (dir == DIAG_L)
+    return DIAG_R;
+  return dir;
+}
+
 void drawLastPlayedCard(const Card &c, int x, int y, bool invert)
 {
   if (c.used)
@@ -299,7 +325,7 @@ void drawLastPlayedCard(const Card &c, int x, int y, bool invert)
   if (invert)
     display.fillRect(x, y, 14, 10, SSD1306_WHITE);
   display.drawRect(x, y, 14, 10, SSD1306_WHITE);
-  drawDirectionGlyphColor(c.dir, x + 4, y + 4, fg);
+  drawDirectionGlyphColor(viewCardDir(c.dir), x + 4, y + 4, fg);
   drawCardNumberGlyphColor(c.value, x + 9, y + 3, fg);
 }
 
@@ -359,33 +385,46 @@ void setNeoLose()
 
 int soundPriority(SoundEvent e)
 {
-  if (e == SFX_WIN_EVT) return 4;
-  if (e == SFX_CONFIRM_EVT) return 3;
-  if (e == SFX_MISS_EVT) return 2;
-  if (e == SFX_CLICK_EVT) return 1;
+  if (e == SFX_WIN_EVT)
+    return 4;
+  if (e == SFX_CONFIRM_EVT)
+    return 3;
+  if (e == SFX_MISS_EVT)
+    return 2;
+  if (e == SFX_CLICK_EVT)
+    return 1;
   return 0;
 }
 
 void emitSound(FrameEffects &fx, SoundEvent e)
 {
-  if (soundPriority(e) > soundPriority(fx.sound)) fx.sound = e;
+  if (soundPriority(e) > soundPriority(fx.sound))
+    fx.sound = e;
 }
 
 void emitNeo(FrameEffects &fx, NeoEvent e)
 {
-  if (e != NEO_NONE) fx.neo = e;
+  if (e != NEO_NONE)
+    fx.neo = e;
 }
 
 void applyEffects(const FrameEffects &fx)
 {
-  if (fx.neo == NEO_NORMAL_EVT) setNeoNormal();
-  else if (fx.neo == NEO_WIN_EVT) setNeoWin();
-  else if (fx.neo == NEO_LOSE_EVT) setNeoLose();
+  if (fx.neo == NEO_NORMAL_EVT)
+    setNeoNormal();
+  else if (fx.neo == NEO_WIN_EVT)
+    setNeoWin();
+  else if (fx.neo == NEO_LOSE_EVT)
+    setNeoLose();
 
-  if (fx.sound == SFX_CLICK_EVT) sfxClick();
-  else if (fx.sound == SFX_CONFIRM_EVT) sfxConfirm();
-  else if (fx.sound == SFX_WIN_EVT) sfxWin();
-  else if (fx.sound == SFX_MISS_EVT) sfxMiss();
+  if (fx.sound == SFX_CLICK_EVT)
+    sfxClick();
+  else if (fx.sound == SFX_CONFIRM_EVT)
+    sfxConfirm();
+  else if (fx.sound == SFX_WIN_EVT)
+    sfxWin();
+  else if (fx.sound == SFX_MISS_EVT)
+    sfxMiss();
 }
 
 void updateButton(ButtonState &b)
@@ -888,10 +927,14 @@ bool applyCard(bool actorIsPlayer, const Card &c, bool animate)
     out = nx < 0 || nx >= BOARD_W || ny < 0 || ny >= BOARD_H;
     if (out)
     {
-      if (ballX < 0) ballX = -1;
-      if (ballX >= BOARD_W) ballX = BOARD_W;
-      if (ballY < 0) ballY = -1;
-      if (ballY >= BOARD_H) ballY = BOARD_H;
+      if (ballX < 0)
+        ballX = -1;
+      if (ballX >= BOARD_W)
+        ballX = BOARD_W;
+      if (ballY < 0)
+        ballY = -1;
+      if (ballY >= BOARD_H)
+        ballY = BOARD_H;
     }
   }
 
@@ -965,23 +1008,23 @@ void drawBoard()
 
   if (ballPlaced)
   {
-    int cx = ox + ballX * cellW + (cellW / 2);
-    int cy = oy + ballY * cellH + (cellH / 2);
+    int cx = ox + viewBoardX(ballX) * cellW + (cellW / 2);
+    int cy = oy + viewBoardY(ballY) * cellH + (cellH / 2);
     // Keep out-of-board ball visible at the nearest edge.
     if (ballX < 0)
-      cx = ox - 2;
+      cx = useMirroredTwoPView() ? ox + cellW * BOARD_W + 2 : ox - 2;
     else if (ballX >= BOARD_W)
-      cx = ox + cellW * BOARD_W + 2;
+      cx = useMirroredTwoPView() ? ox - 2 : ox + cellW * BOARD_W + 2;
     if (ballY < 0)
-      cy = oy - 2;
+      cy = useMirroredTwoPView() ? oy + cellH * BOARD_H + 2 : oy - 2;
     else if (ballY >= BOARD_H)
-      cy = oy + cellH * BOARD_H + 2;
+      cy = useMirroredTwoPView() ? oy - 2 : oy + cellH * BOARD_H + 2;
     display.fillCircle(cx, cy, 2, SSD1306_WHITE);
   }
   if (phase == PHASE_SERVE_POS)
   {
-    int sx = ox + serveX * cellW;
-    int sy = oy + 5 * cellH;
+    int sx = ox + viewBoardX(serveX) * cellW;
+    int sy = oy + viewBoardY(5) * cellH;
     // Serve selection: fill selected cell white, then cut out the ball in black.
     display.fillRect(sx + 1, sy + 1, cellW - 1, cellH - 1, SSD1306_WHITE);
     int pcx = sx + (cellW / 2);
@@ -1008,7 +1051,7 @@ void drawHand(Card hand[], bool showCursor)
     if (showCursor && i == cardCursor)
       display.drawRect(cx - 1, cy - 1, cardW + 2, cardH + 2, SSD1306_WHITE);
     // Vertical layout: direction on top, value below.
-    drawDirectionGlyph(hand[i].dir, cx + 5, cy + 5);
+    drawDirectionGlyph(viewCardDir(hand[i].dir), cx + 5, cy + 5);
     drawCardNumberGlyph(hand[i].value, cx + 4, cy + 12);
   }
 }
@@ -1021,7 +1064,7 @@ void drawHUD()
     uint32_t remain = 0;
     if (millis() - phaseStartedAt < TURN_LIMIT_MS)
       remain = (TURN_LIMIT_MS - (millis() - phaseStartedAt)) / 1000;
-    display.setCursor(94, TOP_INFO_Y);
+    display.setCursor(106, TOP_INFO_Y);
     display.print(remain);
     display.print("s");
   }
@@ -1116,8 +1159,8 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
       display.setCursor(54, 10);
       display.print("ROUND END");
     }
-    // Keep cards visible whenever the board is visible.
-    drawHand(playerHand, phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD || phase == PHASE_CPU_CARD);
+    // Keep the local hand visible, but only show the cursor on the local turn.
+    drawHand(playerHand, phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD);
   }
   display.display();
 }
@@ -1366,21 +1409,10 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
   {
     if (gameMode == MODE_2P)
     {
-      if (in.leftPressed)
-      {
-        moveCursorLR(-1, playerHand);
-        emitSound(fx, SFX_CLICK_EVT);
-      }
-      if (in.rightPressed)
-      {
-        moveCursorLR(1, playerHand);
-        emitSound(fx, SFX_CLICK_EVT);
-      }
-      if (in.upPressed)
-        emitSound(fx, SFX_MISS_EVT);
+      // Opponent turn: keep the local view passive.
       return fx;
     }
-    // During opponent selection, allow card cursor movement but disable confirm.
+    // CPU mode only: let the local player watch the CPU selection.
     if (in.leftPressed)
     {
       moveCursorLR(-1, playerHand);

@@ -47,6 +47,7 @@ arduino-cli monitor -p COM3 -c baudrate=115200
 このリポジトリには以下が含まれています。
 - 回路図: `diagram.json`
 - Wokwi設定: `wokwi.toml`
+- ビルド成果物は `.arduino-build/` を使う
 
 手順:
 1. Wokwiでこのプロジェクトを開く
@@ -56,6 +57,7 @@ arduino-cli monitor -p COM3 -c baudrate=115200
 補足:
 - `wokwi.toml` は `firmware = ".arduino-build/logic-table-tennis.ino.bin"` を参照します。
 - 必要に応じて先にローカルでビルドし、`.arduino-build` 配下の成果物を更新してください。
+- `build/` は使わず、`.arduino-build/` を更新してください。
 
 ## ゲームルールの概要
 - 盤面は `6x6`。
@@ -74,3 +76,6 @@ arduino-cli monitor -p COM3 -c baudrate=115200
   - `UP`: カード決定
 - マッチ終了画面（`MATCH OVER`）
   - `UP`: タイトルへ戻って再戦
+
+## 補足
+- 『ロジタク』というボードゲームのルールをもとにしています。
