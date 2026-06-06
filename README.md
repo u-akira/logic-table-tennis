@@ -59,6 +59,10 @@ arduino-cli monitor -p COM3 -c baudrate=115200
 - 必要に応じて先にローカルでビルドし、`.arduino-build` 配下の成果物を更新してください。
 - `build/` は使わず、`.arduino-build/` を更新してください。
 
+共有URL:
+
+https://wokwi.com/projects/465905983169769473
+
 ## ゲームルールの概要
 - 盤面は `6x6`。
 - プレイヤーとCPUが交互にカードを出してボールを打ち返す。
