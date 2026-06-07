@@ -15,10 +15,12 @@ static const int BOARD_W = 6;
 static const int BOARD_H = 6;
 static const int HAND_SIZE = 6;
 static const uint32_t TURN_LIMIT_MS = 30000;
+static const bool TURN_LIMIT_ENABLED = true;
 static const uint32_t TITLE_MIN_SHOW_MS = 800;
 static const uint32_t BALL_STEP_ANIM_MS = 120;
 static const int TOP_INFO_Y = 14;
 static const int TOP_LABEL_Y = 3;
+static const uint8_t NEO_LEVEL = 32;
 
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixels(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -309,13 +311,53 @@ static int viewBoardY(int y)
 
 static CardDir viewCardDir(CardDir dir)
 {
-  if (!useMirroredTwoPView())
-    return dir;
-  if (dir == DIAG_R)
-    return DIAG_L;
-  if (dir == DIAG_L)
-    return DIAG_R;
   return dir;
+}
+
+static uint8_t actorSeat(bool actorIsPlayer)
+{
+  if (gameMode != MODE_2P)
+    return actorIsPlayer ? 0 : 1;
+  return actorIsPlayer ? localSeat : (uint8_t)(localSeat ^ 1);
+}
+
+static int actorStepY(uint8_t seat)
+{
+  return seat == 0 ? -1 : 1;
+}
+
+static int actorStepX(uint8_t seat, CardDir dir)
+{
+  if (dir == DIAG_R)
+    return seat == 0 ? 1 : -1;
+  if (dir == DIAG_L)
+    return seat == 0 ? -1 : 1;
+  return 0;
+}
+
+static uint8_t serveRowForSeat(uint8_t seat)
+{
+  return seat == 0 ? 5 : 0;
+}
+
+static bool actorReachedOpponentSide(uint8_t seat)
+{
+  return seat == 0 ? ballY <= 2 : ballY >= 3;
+}
+
+static const char *localName()
+{
+  return gameMode == MODE_2P ? "YOU" : "1P";
+}
+
+static const char *opponentName()
+{
+  return gameMode == MODE_2P ? "OPP" : "CPU";
+}
+
+static const char *turnName()
+{
+  return playerTurn ? localName() : opponentName();
 }
 
 static const int BOARD_OX = 3;
@@ -334,12 +376,9 @@ static void drawCardTargetPreview(bool actorIsPlayer, const Card &c)
   if (!ballPlaced || c.used)
     return;
 
-  int signY = actorIsPlayer ? -1 : 1;
-  int dx = 0;
-  if (c.dir == DIAG_R)
-    dx = actorIsPlayer ? 1 : -1;
-  if (c.dir == DIAG_L)
-    dx = actorIsPlayer ? -1 : 1;
+  uint8_t seat = actorSeat(actorIsPlayer);
+  int signY = actorStepY(seat);
+  int dx = actorStepX(seat, c.dir);
 
   int nx = ballX + dx * c.value;
   int ny = ballY + signY * c.value;
@@ -407,7 +446,7 @@ void setNeoNormal()
 {
   for (int i = 0; i < NUM_LEDS; ++i)
   {
-    pixels.setPixelColor(i, i < playerGames ? pixels.Color(0, 80, 0) : 0);
+    pixels.setPixelColor(i, i < playerGames ? pixels.Color(0, NEO_LEVEL, 0) : 0);
   }
   pixels.show();
 }
@@ -415,14 +454,14 @@ void setNeoNormal()
 void setNeoWin()
 {
   for (int i = 0; i < NUM_LEDS; ++i)
-    pixels.setPixelColor(i, pixels.Color(0, 0, 80));
+    pixels.setPixelColor(i, pixels.Color(0, 0, NEO_LEVEL));
   pixels.show();
 }
 
 void setNeoLose()
 {
   for (int i = 0; i < NUM_LEDS; ++i)
-    pixels.setPixelColor(i, pixels.Color(80, 0, 0));
+    pixels.setPixelColor(i, pixels.Color(NEO_LEVEL, 0, 0));
   pixels.show();
 }
 
@@ -517,7 +556,8 @@ enum TwoPMsgType : uint8_t
   TWO_P_START = 2,
   TWO_P_ACK = 3,
   TWO_P_SERVE_POS = 4,
-  TWO_P_CARD = 5
+  TWO_P_CARD = 5,
+  TWO_P_ROUND_RESULT = 6
 };
 
 struct __attribute__((packed)) TwoPMessage
@@ -576,6 +616,8 @@ const char *twoPMsgName(uint8_t type)
     return "SERVE_POS";
   case TWO_P_CARD:
     return "CARD";
+  case TWO_P_ROUND_RESULT:
+    return "ROUND_RESULT";
   default:
     return "UNKNOWN";
   }
@@ -606,7 +648,7 @@ int findMatchingCardIndex(Card hand[], const Card &c)
 }
 
 bool applyCard(bool actorIsPlayer, const Card &c, bool animate = true);
-void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx);
+void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx, bool notifyPeer = true);
 
 bool hasUsableCard(Card hand[])
 {
@@ -702,6 +744,18 @@ void twoPEnsurePeer(const uint8_t *mac)
   Serial.println();
 }
 
+void twoPBindPeer(const uint8_t *mac)
+{
+  memcpy(twoPPeerMac, mac, 6);
+  twoPConnected = true;
+  twoPEnsurePeer(mac);
+  uint8_t localMac[6];
+  WiFi.macAddress(localMac);
+  localSeat = macLess(localMac, twoPPeerMac) ? 0 : 1;
+  twoPLeader = macLess(localMac, twoPPeerMac);
+  syncTwoPViewState();
+}
+
 void twoPStartSession(uint32_t nowMs, FrameEffects &fx)
 {
   if (twoPSessionActive)
@@ -720,16 +774,9 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
     Serial.print("[2P] peer hello from=");
     twoPPrintMac(mac);
     Serial.printf(" nonce=%lu\n", (unsigned long)msg.nonce);
-    memcpy(twoPPeerMac, mac, 6);
     twoPPeerNonce = msg.nonce;
-    twoPConnected = true;
-    twoPEnsurePeer(mac);
-    uint8_t localMac[6];
-    WiFi.macAddress(localMac);
-    localSeat = macLess(localMac, twoPPeerMac) ? 0 : 1;
-    twoPLeader = macLess(localMac, twoPPeerMac);
+    twoPBindPeer(mac);
     Serial.printf("[2P] connected localSeat=%u leader=%u\n", localSeat, twoPLeader ? 1 : 0);
-    syncTwoPViewState();
     return;
   }
 
@@ -739,11 +786,10 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
     twoPPrintMac(mac);
     Serial.printf(" seed=%lu server=%u turn=%u\n",
                   (unsigned long)msg.seed, msg.serverId, msg.turnId);
+    twoPBindPeer(mac);
     serverSeat = msg.serverId;
     turnSeat = msg.turnId;
     twoPSessionSeed = msg.seed;
-    twoPConnected = true;
-    twoPEnsurePeer(mac);
     syncTwoPViewState();
     twoPStartSession(nowMs, fx);
     TwoPMessage ackMsg = {};
@@ -756,7 +802,7 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
   if (msg.type == TWO_P_ACK)
   {
     Serial.println("[2P] ack received");
-    twoPConnected = true;
+    twoPBindPeer(mac);
     twoPStartSession(nowMs, fx);
     return;
   }
@@ -770,7 +816,7 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
       return;
     serveX = msg.servePos;
     ballX = serveX;
-    ballY = playerServe ? 5 : 0;
+    ballY = serveRowForSeat(serverSeat);
     ballPlaced = true;
     phase = PHASE_CPU_CARD;
     phaseStartedAt = nowMs;
@@ -802,6 +848,17 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
     playerTurn = true;
     phase = PHASE_PLAYER_CARD;
     phaseStartedAt = nowMs;
+    return;
+  }
+
+  if (msg.type == TWO_P_ROUND_RESULT)
+  {
+    if (phase == PHASE_GAME_OVER || phase == PHASE_MATCH_OVER)
+      return;
+    bool localWon = msg.seatId == localSeat;
+    Serial.printf("[2P] round result winnerSeat=%u localWon=%u\n",
+                  msg.seatId, localWon ? 1 : 0);
+    awardRound(localWon, nowMs, fx, false);
   }
 }
 
@@ -977,6 +1034,17 @@ void twoPSendCard(const Card &c)
   twoPSendMessage(twoPPeerMac, msg);
 }
 
+void twoPSendRoundResult(uint8_t winnerSeat)
+{
+  if (!twoPNetReady || !twoPConnected || !twoPSessionActive)
+    return;
+  TwoPMessage msg = {};
+  msg.type = TWO_P_ROUND_RESULT;
+  msg.seatId = winnerSeat;
+  msg.turnIndex = turnCount;
+  twoPSendMessage(twoPPeerMac, msg);
+}
+
 void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
 {
   if (gameMode == MODE_2P)
@@ -997,6 +1065,9 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
   {
     turnSeat = serverSeat;
     syncTwoPViewState();
+    Serial.printf("[2P] deal localSeat=%u server=%u turn=%u firstCard=%s%u\n",
+                  localSeat, serverSeat, turnSeat,
+                  dirLabel(playerHand[0].dir), playerHand[0].value);
   }
   else
   {
@@ -1009,12 +1080,9 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
 
 bool applyCard(bool actorIsPlayer, const Card &c, bool animate)
 {
-  int signY = actorIsPlayer ? -1 : 1;
-  int dx = 0;
-  if (c.dir == DIAG_R)
-    dx = actorIsPlayer ? 1 : -1;
-  if (c.dir == DIAG_L)
-    dx = actorIsPlayer ? -1 : 1;
+  uint8_t seat = actorSeat(actorIsPlayer);
+  int signY = actorStepY(seat);
+  int dx = actorStepX(seat, c.dir);
   bool out = false;
   bool sideFail = false;
 
@@ -1059,17 +1127,20 @@ bool applyCard(bool actorIsPlayer, const Card &c, bool animate)
   // Must reach opponent side in one shot.
   if (!out)
   {
-    if (actorIsPlayer && ballY > 2)
-      sideFail = true;
-    if (!actorIsPlayer && ballY < 3)
-      sideFail = true;
+    sideFail = !actorReachedOpponentSide(seat);
   }
 
   return !out && !sideFail;
 }
 
-void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx)
+void awardRound(bool playerWon, uint32_t nowMs, FrameEffects &fx, bool notifyPeer)
 {
+  if (gameMode == MODE_2P && notifyPeer)
+  {
+    uint8_t winnerSeat = playerWon ? localSeat : (uint8_t)(localSeat ^ 1);
+    twoPSendRoundResult(winnerSeat);
+  }
+
   if (playerWon)
   {
     playerGames++;
@@ -1148,7 +1219,8 @@ void drawBoard()
   if (phase == PHASE_SERVE_POS)
   {
     int sx = ox + viewBoardX(serveX) * cellW;
-    int sy = oy + viewBoardY(5) * cellH;
+    int serveRow = serveRowForSeat(gameMode == MODE_2P ? localSeat : 0);
+    int sy = oy + viewBoardY(serveRow) * cellH;
     // Serve selection: fill selected cell white, then cut out the ball in black.
     display.fillRect(sx + 1, sy + 1, cellW - 1, cellH - 1, SSD1306_WHITE);
     int pcx = sx + (cellW / 2);
@@ -1183,8 +1255,12 @@ void drawHand(Card hand[], bool showCursor)
 void drawHUD()
 {
   display.setTextSize(1);
-  if (phase == PHASE_PLAYER_CARD || phase == PHASE_CPU_CARD)
+  bool waitingForOpponentServe = gameMode == MODE_2P && phase == PHASE_CPU_CARD && !ballPlaced;
+  bool showTurnTimer = phase == PHASE_PLAYER_CARD || phase == PHASE_CPU_CARD;
+  if (TURN_LIMIT_ENABLED && showTurnTimer)
   {
+    if (waitingForOpponentServe)
+      return;
     uint32_t remain = 0;
     if (millis() - phaseStartedAt < TURN_LIMIT_MS)
       remain = (TURN_LIMIT_MS - (millis() - phaseStartedAt)) / 1000;
@@ -1223,13 +1299,15 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     display.setCursor(44, 20);
     display.print("Game");
     display.print((int)(playerGames + cpuGames + 1));
-    display.setCursor(24, 32);
-    display.print("1P ");
+    display.setCursor(18, 32);
+    display.print(localName());
+    display.print(" ");
     display.print(playerGames);
     display.print(" - ");
     display.print(cpuGames);
-    display.print(gameMode == MODE_CPU ? " CPU" : " 2P");
-    display.setCursor(46, 44);
+    display.print(" ");
+    display.print(opponentName());
+    display.setCursor(34, 44);
     display.print(playerServe ? "Serve" : "Receive");
   }
   else if (phase == PHASE_MATCH_OVER)
@@ -1239,13 +1317,15 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     if (playerGames >= 3)
       display.print("YOU WIN MATCH");
     else
-      display.print(gameMode == MODE_CPU ? "CPU WIN MATCH" : "2P WIN MATCH");
-    display.setCursor(24, 30);
-    display.print("1P ");
+      display.print(gameMode == MODE_CPU ? "CPU WIN MATCH" : "OPP WIN MATCH");
+    display.setCursor(18, 30);
+    display.print(localName());
+    display.print(" ");
     display.print(playerGames);
     display.print(" - ");
     display.print(cpuGames);
-    display.print(gameMode == MODE_CPU ? " CPU" : " 2P");
+    display.print(" ");
+    display.print(opponentName());
     display.setCursor(20, 42);
     display.print("UP: RETRY");
   }
@@ -1270,13 +1350,13 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
     }
     else if (phase == PHASE_CPU_CARD)
     {
-      display.setCursor(106, TOP_LABEL_Y);
-      display.print(gameMode == MODE_CPU ? "CPU" : "2P");
+      display.setCursor(104, TOP_LABEL_Y);
+      display.print(opponentName());
     }
     else if (phase == PHASE_PLAYER_CARD)
     {
       display.setCursor(104, TOP_LABEL_Y);
-      display.print("1P");
+      display.print(localName());
     }
     if (phase == PHASE_GAME_OVER)
     {
@@ -1459,12 +1539,12 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
     {
       phase = playerTurn ? PHASE_SERVE_POS : PHASE_CPU_CARD;
       phaseStartedAt = nowMs;
-      if (phase == PHASE_CPU_CARD)
+      if (phase == PHASE_CPU_CARD && gameMode == MODE_CPU)
       {
         // CPU serves first in this game: place the serve ball before card play.
         serveX = (uint8_t)random(0, BOARD_W);
         ballX = serveX;
-        ballY = 0;
+        ballY = serveRowForSeat(1);
         ballPlaced = true;
         cpuActionDelayMs = randomCpuDelayMs();
       }
@@ -1483,20 +1563,25 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
   }
   else if (phase == PHASE_SERVE_POS)
   {
-    if (in.leftPressed && serveX > 0)
+    int visibleDelta = 0;
+    if (in.leftPressed)
+      visibleDelta = -1;
+    if (in.rightPressed)
+      visibleDelta = 1;
+    if (visibleDelta != 0)
     {
-      serveX--;
-      emitSound(fx, SFX_CLICK_EVT);
-    }
-    if (in.rightPressed && serveX < 5)
-    {
-      serveX++;
-      emitSound(fx, SFX_CLICK_EVT);
+      int internalDelta = useMirroredTwoPView() ? -visibleDelta : visibleDelta;
+      int nextServeX = (int)serveX + internalDelta;
+      if (nextServeX >= 0 && nextServeX < BOARD_W)
+      {
+        serveX = (uint8_t)nextServeX;
+        emitSound(fx, SFX_CLICK_EVT);
+      }
     }
     if (in.upPressed)
     {
       ballX = serveX;
-      ballY = playerServe ? 5 : 0;
+      ballY = serveRowForSeat(gameMode == MODE_2P ? localSeat : 0);
       ballPlaced = true;
       twoPSendServePos(serveX);
       phase = PHASE_SERVE_CARD;
@@ -1526,7 +1611,7 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
       }
       if (in.upPressed)
         pickAndApplyPlayerCard(nowMs, fx);
-      if (phase == PHASE_PLAYER_CARD && nowMs - phaseStartedAt >= TURN_LIMIT_MS)
+      if (TURN_LIMIT_ENABLED && phase == PHASE_PLAYER_CARD && nowMs - phaseStartedAt >= TURN_LIMIT_MS)
       {
         awardRound(false, nowMs, fx);
       }
@@ -1558,7 +1643,7 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
     cpuGhostCursor = (cpuGhostCursor + 1) % HAND_SIZE;
     if (nowMs - phaseStartedAt >= cpuActionDelayMs)
       cpuPlay(nowMs, fx);
-    if (nowMs - phaseStartedAt >= TURN_LIMIT_MS)
+    if (TURN_LIMIT_ENABLED && nowMs - phaseStartedAt >= TURN_LIMIT_MS)
     {
       awardRound(true, nowMs, fx);
     }
