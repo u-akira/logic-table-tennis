@@ -1310,7 +1310,7 @@ void cpuPlay(uint32_t nowMs, FrameEffects &fx)
 
 uint32_t randomCpuDelayMs()
 {
-  return (uint32_t)random(10000, 20001);
+  return (uint32_t)random(3000, 7001);
 }
 
 void setup()
