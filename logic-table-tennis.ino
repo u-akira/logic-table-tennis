@@ -5,6 +5,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_err.h>
 #include <esp_wifi.h>
 #include "config.h"
 
@@ -537,6 +538,9 @@ struct __attribute__((packed)) TwoPMessage
 static volatile bool gTwoPPacketReady = false;
 static TwoPMessage gTwoPPacket;
 static uint8_t gTwoPPacketMac[6] = {0, 0, 0, 0, 0, 0};
+static volatile bool gTwoPBadPacketReady = false;
+static volatile int gTwoPBadPacketLen = 0;
+static volatile uint8_t gTwoPBadPacketType = 0;
 
 bool sameMac(const uint8_t *a, const uint8_t *b)
 {
@@ -556,6 +560,31 @@ bool macLess(const uint8_t *a, const uint8_t *b)
       return a[i] < b[i];
   }
   return false;
+}
+
+const char *twoPMsgName(uint8_t type)
+{
+  switch (type)
+  {
+  case TWO_P_HELLO:
+    return "HELLO";
+  case TWO_P_START:
+    return "START";
+  case TWO_P_ACK:
+    return "ACK";
+  case TWO_P_SERVE_POS:
+    return "SERVE_POS";
+  case TWO_P_CARD:
+    return "CARD";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void twoPPrintMac(const uint8_t *mac)
+{
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 void syncTwoPViewState()
@@ -651,7 +680,10 @@ void twoPSendMessage(const uint8_t *mac, const TwoPMessage &msg)
 {
   if (!twoPNetReady)
     return;
-  esp_now_send(mac, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
+  esp_err_t err = esp_now_send(mac, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg));
+  Serial.printf("[2P] tx %s err=%s to=", twoPMsgName(msg.type), esp_err_to_name(err));
+  twoPPrintMac(mac);
+  Serial.println();
 }
 
 void twoPEnsurePeer(const uint8_t *mac)
@@ -664,7 +696,10 @@ void twoPEnsurePeer(const uint8_t *mac)
   peerInfo.channel = 1;
   peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_STA;
-  esp_now_add_peer(&peerInfo);
+  esp_err_t err = esp_now_add_peer(&peerInfo);
+  Serial.printf("[2P] add peer err=%s mac=", esp_err_to_name(err));
+  twoPPrintMac(mac);
+  Serial.println();
 }
 
 void twoPStartSession(uint32_t nowMs, FrameEffects &fx)
@@ -682,6 +717,9 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
 {
   if (msg.type == TWO_P_HELLO)
   {
+    Serial.print("[2P] peer hello from=");
+    twoPPrintMac(mac);
+    Serial.printf(" nonce=%lu\n", (unsigned long)msg.nonce);
     memcpy(twoPPeerMac, mac, 6);
     twoPPeerNonce = msg.nonce;
     twoPConnected = true;
@@ -690,12 +728,17 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
     WiFi.macAddress(localMac);
     localSeat = macLess(localMac, twoPPeerMac) ? 0 : 1;
     twoPLeader = macLess(localMac, twoPPeerMac);
+    Serial.printf("[2P] connected localSeat=%u leader=%u\n", localSeat, twoPLeader ? 1 : 0);
     syncTwoPViewState();
     return;
   }
 
   if (msg.type == TWO_P_START)
   {
+    Serial.print("[2P] start from=");
+    twoPPrintMac(mac);
+    Serial.printf(" seed=%lu server=%u turn=%u\n",
+                  (unsigned long)msg.seed, msg.serverId, msg.turnId);
     serverSeat = msg.serverId;
     turnSeat = msg.turnId;
     twoPSessionSeed = msg.seed;
@@ -712,6 +755,7 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
 
   if (msg.type == TWO_P_ACK)
   {
+    Serial.println("[2P] ack received");
     twoPConnected = true;
     twoPStartSession(nowMs, fx);
     return;
@@ -774,7 +818,21 @@ void twoPProcessNetwork(uint32_t nowMs, FrameEffects &fx)
     memcpy(mac, gTwoPPacketMac, 6);
     gTwoPPacketReady = false;
     interrupts();
+    Serial.printf("[2P] rx %s len=%u from=", twoPMsgName(msg.type), (unsigned)sizeof(TwoPMessage));
+    twoPPrintMac(mac);
+    Serial.println();
     twoPHandlePacket(mac, msg, nowMs, fx);
+  }
+
+  if (gTwoPBadPacketReady)
+  {
+    noInterrupts();
+    int badLen = gTwoPBadPacketLen;
+    uint8_t badType = gTwoPBadPacketType;
+    gTwoPBadPacketReady = false;
+    interrupts();
+    Serial.printf("[2P] rx ignored len=%d type=%u expected=%u\n",
+                  badLen, badType, (unsigned)sizeof(TwoPMessage));
   }
 
   if (phase != PHASE_2P_WAIT && !twoPSessionActive)
@@ -817,7 +875,12 @@ static void twoPOnReceive(const uint8_t *mac, const uint8_t *data, int len)
 #endif
 {
   if (len != (int)sizeof(TwoPMessage))
+  {
+    gTwoPBadPacketLen = len;
+    gTwoPBadPacketType = len > 0 ? data[0] : 0;
+    gTwoPBadPacketReady = true;
     return;
+  }
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   memcpy(gTwoPPacketMac, info->src_addr, 6);
 #else
@@ -833,21 +896,31 @@ void twoPInitNetwork(uint32_t nowMs)
     return;
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(false, true);
   WiFi.setSleep(false);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  uint8_t localMac[6];
+  WiFi.macAddress(localMac);
+  Serial.print("[2P] init local=");
+  twoPPrintMac(localMac);
+  Serial.println();
+  esp_err_t channelErr = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[2P] channel 1 err=%s\n", esp_err_to_name(channelErr));
 
-  if (esp_now_init() != ESP_OK)
+  esp_err_t initErr = esp_now_init();
+  Serial.printf("[2P] esp_now_init err=%s\n", esp_err_to_name(initErr));
+  if (initErr != ESP_OK)
     return;
 
-  esp_now_register_recv_cb(twoPOnReceive);
+  esp_err_t recvErr = esp_now_register_recv_cb(twoPOnReceive);
+  Serial.printf("[2P] recv_cb err=%s\n", esp_err_to_name(recvErr));
 
   esp_now_peer_info_t broadcastPeer = {};
   memcpy(broadcastPeer.peer_addr, kBroadcastMac, 6);
   broadcastPeer.channel = 1;
   broadcastPeer.encrypt = false;
   broadcastPeer.ifidx = WIFI_IF_STA;
-  esp_now_add_peer(&broadcastPeer);
+  esp_err_t peerErr = esp_now_add_peer(&broadcastPeer);
+  Serial.printf("[2P] add broadcast err=%s\n", esp_err_to_name(peerErr));
 
   twoPLocalNonce = esp_random();
   twoPLastHelloAt = nowMs;
@@ -862,7 +935,9 @@ void twoPInitNetwork(uint32_t nowMs)
   twoPPeerNonce = 0;
   memset(twoPPeerMac, 0, sizeof(twoPPeerMac));
   gTwoPPacketReady = false;
+  gTwoPBadPacketReady = false;
   twoPNetReady = true;
+  Serial.println("[2P] net ready");
 }
 
 void twoPShutdownNetwork()
@@ -872,6 +947,7 @@ void twoPShutdownNetwork()
   esp_now_deinit();
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
+  Serial.println("[2P] net off");
   twoPNetReady = false;
   twoPConnected = false;
   twoPSessionActive = false;

@@ -35,12 +35,12 @@ arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C3 .
 
 書き込み（ポートは環境に合わせて変更）:
 ```powershell
-arduino-cli upload -p COM3 --fqbn esp32:esp32:XIAO_ESP32C3 .
+arduino-cli upload -p COM5 --fqbn esp32:esp32:XIAO_ESP32C3 .
 ```
 
 シリアルモニタ:
 ```powershell
-arduino-cli monitor -p COM3 -c baudrate=115200
+arduino-cli monitor -p COM5 -c baudrate=115200
 ```
 
 ### Wokwi
