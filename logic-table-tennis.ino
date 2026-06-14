@@ -13,7 +13,11 @@ static const int SCREEN_W = 128;
 static const int SCREEN_H = 64;
 static const int BOARD_W = 6;
 static const int BOARD_H = 6;
-static const int HAND_SIZE = 6;
+static const int HAND_SIZE = 7;
+static const int BASIC_DECK_SIZE = 15;
+static const int SPECIAL_POOL_SIZE = 5;
+static const int SPECIALS_PER_GAME = 3;
+static const int ROUND_DECK_SIZE = BASIC_DECK_SIZE + SPECIALS_PER_GAME;
 static const uint32_t TURN_LIMIT_MS = 30000;
 static const bool TURN_LIMIT_ENABLED = true;
 static const uint32_t TITLE_MIN_SHOW_MS = 800;
@@ -31,8 +35,18 @@ enum CardDir
   DIAG_R,
   DIAG_L
 };
+enum CardKind : uint8_t
+{
+  CARD_BASIC,
+  CARD_DROP,
+  CARD_CHIQUITA,
+  CARD_CUT,
+  CARD_NET_IN,
+  CARD_COUNTER
+};
 struct Card
 {
+  CardKind kind;
   CardDir dir;
   uint8_t value;
   bool used;
@@ -46,6 +60,7 @@ enum Phase
   PHASE_SERVE_POS,
   PHASE_SERVE_CARD,
   PHASE_PLAYER_CARD,
+  PHASE_SPECIAL_TARGET,
   PHASE_CPU_CARD,
   PHASE_GAME_OVER,
   PHASE_MATCH_OVER
@@ -82,6 +97,10 @@ struct GameContext
   uint8_t serveX = 2;
   uint8_t cardCursor = 0;
   uint8_t cpuGhostCursor = 0;
+  uint8_t specialTargetCursor = 0;
+  uint8_t specialTargetCount = 0;
+  uint8_t pendingHandIndex = 0;
+  Phase pendingReturnPhase = PHASE_PLAYER_CARD;
   int8_t ballX = 2;
   int8_t ballY = 5;
   bool ballPlaced = false;
@@ -105,10 +124,15 @@ struct GameContext
   uint32_t twoPLastStartAt = 0;
   uint8_t twoPPeerMac[6] = {0, 0, 0, 0, 0, 0};
   uint32_t twoPPeerNonce = 0;
-  Card lastPlayerCard{STRAIGHT, 0, true};
-  Card lastCpuCard{STRAIGHT, 0, true};
+  Card lastPlayerCard{CARD_BASIC, STRAIGHT, 0, true};
+  Card lastCpuCard{CARD_BASIC, STRAIGHT, 0, true};
+  Card pendingCard{CARD_BASIC, STRAIGHT, 0, true};
   Card playerHand[HAND_SIZE];
   Card cpuHand[HAND_SIZE];
+  int8_t specialTargetX[3] = {0, 0, 0};
+  int8_t specialTargetY[3] = {0, 0, 0};
+  CardDir specialTargetDir[3] = {STRAIGHT, STRAIGHT, STRAIGHT};
+  uint8_t specialTargetValue[3] = {0, 0, 0};
 };
 
 struct InputState
@@ -158,6 +182,10 @@ uint32_t randomCpuDelayMs();
 #define serveX g.serveX
 #define cardCursor g.cardCursor
 #define cpuGhostCursor g.cpuGhostCursor
+#define specialTargetCursor g.specialTargetCursor
+#define specialTargetCount g.specialTargetCount
+#define pendingHandIndex g.pendingHandIndex
+#define pendingReturnPhase g.pendingReturnPhase
 #define ballX g.ballX
 #define ballY g.ballY
 #define ballPlaced g.ballPlaced
@@ -183,25 +211,38 @@ uint32_t randomCpuDelayMs();
 #define twoPPeerNonce g.twoPPeerNonce
 #define lastPlayerCard g.lastPlayerCard
 #define lastCpuCard g.lastCpuCard
+#define pendingCard g.pendingCard
 #define playerHand g.playerHand
 #define cpuHand g.cpuHand
+#define specialTargetX g.specialTargetX
+#define specialTargetY g.specialTargetY
+#define specialTargetDir g.specialTargetDir
+#define specialTargetValue g.specialTargetValue
 
-const Card kDeck[15] = {
-    {STRAIGHT, 1, false},
-    {STRAIGHT, 2, false},
-    {STRAIGHT, 3, false},
-    {STRAIGHT, 4, false},
-    {STRAIGHT, 5, false},
-    {DIAG_R, 1, false},
-    {DIAG_R, 2, false},
-    {DIAG_R, 3, false},
-    {DIAG_R, 4, false},
-    {DIAG_R, 4, false},
-    {DIAG_L, 1, false},
-    {DIAG_L, 2, false},
-    {DIAG_L, 3, false},
-    {DIAG_L, 4, false},
-    {DIAG_L, 4, false},
+const Card kBasicDeck[BASIC_DECK_SIZE] = {
+    {CARD_BASIC, STRAIGHT, 1, false},
+    {CARD_BASIC, STRAIGHT, 2, false},
+    {CARD_BASIC, STRAIGHT, 3, false},
+    {CARD_BASIC, STRAIGHT, 4, false},
+    {CARD_BASIC, STRAIGHT, 5, false},
+    {CARD_BASIC, DIAG_R, 1, false},
+    {CARD_BASIC, DIAG_R, 2, false},
+    {CARD_BASIC, DIAG_R, 3, false},
+    {CARD_BASIC, DIAG_R, 4, false},
+    {CARD_BASIC, DIAG_R, 4, false},
+    {CARD_BASIC, DIAG_L, 1, false},
+    {CARD_BASIC, DIAG_L, 2, false},
+    {CARD_BASIC, DIAG_L, 3, false},
+    {CARD_BASIC, DIAG_L, 4, false},
+    {CARD_BASIC, DIAG_L, 4, false},
+};
+
+const Card kSpecialPool[SPECIAL_POOL_SIZE] = {
+    {CARD_DROP, STRAIGHT, 1, false},
+    {CARD_CHIQUITA, STRAIGHT, 3, false},
+    {CARD_CUT, STRAIGHT, 2, false},
+    {CARD_NET_IN, STRAIGHT, 1, false},
+    {CARD_COUNTER, STRAIGHT, 1, false},
 };
 
 static inline const char *dirLabel(CardDir d)
@@ -211,6 +252,35 @@ static inline const char *dirLabel(CardDir d)
   if (d == DIAG_R)
     return "UR";
   return "UL";
+}
+
+static inline const char *cardKindLabel(CardKind kind)
+{
+  switch (kind)
+  {
+  case CARD_DROP:
+    return "DR";
+  case CARD_CHIQUITA:
+    return "CH";
+  case CARD_CUT:
+    return "CT";
+  case CARD_NET_IN:
+    return "NI";
+  case CARD_COUNTER:
+    return "CO";
+  default:
+    return "";
+  }
+}
+
+static inline bool isSpecialCard(const Card &c)
+{
+  return c.kind != CARD_BASIC;
+}
+
+static inline void resetDealtCard(Card &c)
+{
+  c.used = false;
 }
 
 void drawDirectionGlyph(CardDir dir, int x, int y)
@@ -294,6 +364,15 @@ void drawCardNumberGlyphColor(uint8_t value, int x, int y, uint16_t color)
     display.drawLine(x, y + 2, x + 2, y + 2, color);
 }
 
+void drawSpecialCardLabel(const Card &c, int x, int y, uint16_t color)
+{
+  display.setTextSize(1);
+  display.setTextColor(color);
+  display.setCursor(c.kind == CARD_NET_IN ? x + 1 : x, y);
+  display.print(cardKindLabel(c.kind));
+  display.setTextColor(SSD1306_WHITE);
+}
+
 static bool useMirroredTwoPView()
 {
   return gameMode == MODE_2P && localSeat == 1;
@@ -345,6 +424,58 @@ static bool actorReachedOpponentSide(uint8_t seat)
   return seat == 0 ? ballY <= 2 : ballY >= 3;
 }
 
+static bool boardContains(int x, int y)
+{
+  return x >= 0 && x < BOARD_W && y >= 0 && y < BOARD_H;
+}
+
+static bool targetReachedOpponentSide(uint8_t seat, int y)
+{
+  return seat == 0 ? y <= 2 : y >= 3;
+}
+
+static uint8_t actorOwnFrontRow(uint8_t seat)
+{
+  return seat == 0 ? 3 : 2;
+}
+
+static uint8_t actorOwnBackRow(uint8_t seat)
+{
+  return serveRowForSeat(seat);
+}
+
+static uint8_t actorOwnMidRow(uint8_t seat)
+{
+  return seat == 0 ? 4 : 1;
+}
+
+static uint8_t actorEnemyBackRow(uint8_t seat)
+{
+  return seat == 0 ? 0 : 5;
+}
+
+static uint8_t actorEnemyMidRow(uint8_t seat)
+{
+  return seat == 0 ? 1 : 4;
+}
+
+static uint8_t actorEnemyFrontRow(uint8_t seat)
+{
+  return seat == 0 ? 2 : 3;
+}
+
+static uint8_t currentServerSeat()
+{
+  if (gameMode == MODE_2P)
+    return serverSeat;
+  return playerServe ? 0 : 1;
+}
+
+static bool isServeCardTurnForActor(bool actorIsPlayer)
+{
+  return turnCount == 0 && ballPlaced && actorSeat(actorIsPlayer) == currentServerSeat();
+}
+
 static const char *localName()
 {
   return gameMode == MODE_2P ? "YOU" : "1P";
@@ -371,10 +502,160 @@ static void drawPreviewDot(int cx, int cy)
   display.fillCircle(cx, cy, 1, SSD1306_WHITE);
 }
 
+static void clearSpecialTargets()
+{
+  specialTargetCursor = 0;
+  specialTargetCount = 0;
+}
+
+static void addSpecialTarget(uint8_t seat, int x, int y, CardDir dir, uint8_t value, bool requireOpponentSide = true)
+{
+  if (specialTargetCount >= 3)
+    return;
+  if (!boardContains(x, y) || (requireOpponentSide && !targetReachedOpponentSide(seat, y)))
+    return;
+  specialTargetX[specialTargetCount] = (int8_t)x;
+  specialTargetY[specialTargetCount] = (int8_t)y;
+  specialTargetDir[specialTargetCount] = dir;
+  specialTargetValue[specialTargetCount] = value;
+  specialTargetCount++;
+}
+
+static const Card &opponentLastCardForActor(bool actorIsPlayer)
+{
+  return actorIsPlayer ? lastCpuCard : lastPlayerCard;
+}
+
+static bool buildSpecialTargets(bool actorIsPlayer, const Card &c)
+{
+  clearSpecialTargets();
+  if (!ballPlaced || !isSpecialCard(c))
+    return false;
+
+  uint8_t seat = actorSeat(actorIsPlayer);
+  if (c.kind == CARD_DROP)
+  {
+    addSpecialTarget(seat, ballX + actorStepX(seat, DIAG_L), ballY + actorStepY(seat), DIAG_L, 1, false);
+    addSpecialTarget(seat, ballX, ballY + actorStepY(seat), STRAIGHT, 1, false);
+    addSpecialTarget(seat, ballX + actorStepX(seat, DIAG_R), ballY + actorStepY(seat), DIAG_R, 1, false);
+    return specialTargetCount > 0;
+  }
+
+  if (c.kind == CARD_COUNTER)
+  {
+    const Card &prev = opponentLastCardForActor(actorIsPlayer);
+    if (prev.used || prev.value == 0)
+      return false;
+    if (prev.dir != STRAIGHT)
+      addSpecialTarget(seat, ballX, ballY + actorStepY(seat) * prev.value, STRAIGHT, prev.value);
+    if (prev.dir != DIAG_L)
+      addSpecialTarget(seat, ballX + actorStepX(seat, DIAG_L) * prev.value, ballY + actorStepY(seat) * prev.value, DIAG_L, prev.value);
+    if (prev.dir != DIAG_R)
+      addSpecialTarget(seat, ballX + actorStepX(seat, DIAG_R) * prev.value, ballY + actorStepY(seat) * prev.value, DIAG_R, prev.value);
+    return specialTargetCount > 0;
+  }
+
+  return false;
+}
+
+static bool cardNeedsTargetChoice(const Card &c)
+{
+  return c.kind == CARD_DROP || c.kind == CARD_COUNTER;
+}
+
+static bool specialCardAvailable(bool actorIsPlayer, const Card &c)
+{
+  if (!ballPlaced)
+    return false;
+  if (!isSpecialCard(c))
+    return true;
+  if (isServeCardTurnForActor(actorIsPlayer))
+    return false;
+
+  uint8_t seat = actorSeat(actorIsPlayer);
+  if (c.kind == CARD_CHIQUITA)
+    return ballY != actorOwnBackRow(seat) && boardContains(ballX, ballY);
+  if (c.kind == CARD_CUT)
+    return ballY != actorOwnMidRow(seat) && boardContains(ballX, ballY);
+  if (c.kind == CARD_NET_IN)
+    return ballY != actorOwnFrontRow(seat) && boardContains(ballX, ballY);
+  if (cardNeedsTargetChoice(c))
+    return buildSpecialTargets(actorIsPlayer, c);
+  return false;
+}
+
+static Card selectedSpecialTargetCard(const Card &base, uint8_t index)
+{
+  Card c = base;
+  c.dir = specialTargetDir[index];
+  c.value = specialTargetValue[index];
+  c.used = false;
+  return c;
+}
+
+static bool selectedSpecialTargetReachesOpponent(uint8_t seat, uint8_t index)
+{
+  return targetReachedOpponentSide(seat, specialTargetY[index]);
+}
+
+static bool prepareAutomaticCard(bool actorIsPlayer, Card &c)
+{
+  if (!isSpecialCard(c))
+    return true;
+  if (!specialCardAvailable(actorIsPlayer, c))
+    return false;
+  if (cardNeedsTargetChoice(c))
+  {
+    uint8_t seat = actorSeat(actorIsPlayer);
+    for (uint8_t i = 0; i < specialTargetCount; ++i)
+    {
+      if (selectedSpecialTargetReachesOpponent(seat, i))
+      {
+        c = selectedSpecialTargetCard(c, i);
+        return true;
+      }
+    }
+    c = selectedSpecialTargetCard(c, 0);
+  }
+  return true;
+}
+
 static void drawCardTargetPreview(bool actorIsPlayer, const Card &c)
 {
   if (!ballPlaced || c.used)
     return;
+
+  if (isSpecialCard(c))
+  {
+    int8_t bx = ballX;
+    int8_t by = ballY;
+    if (cardNeedsTargetChoice(c))
+    {
+      if (!buildSpecialTargets(actorIsPlayer, c))
+        return;
+      for (uint8_t i = 0; i < specialTargetCount; ++i)
+      {
+        int cx = BOARD_OX + viewBoardX(specialTargetX[i]) * BOARD_CELL_W + (BOARD_CELL_W / 2);
+        int cy = BOARD_OY + viewBoardY(specialTargetY[i]) * BOARD_CELL_H + (BOARD_CELL_H / 2);
+        drawPreviewDot(cx, cy);
+      }
+    }
+    else
+    {
+      Card preview = c;
+      bool ok = specialCardAvailable(actorIsPlayer, preview);
+      ballX = bx;
+      ballY = by;
+      if (!ok)
+        return;
+      uint8_t seat = actorSeat(actorIsPlayer);
+      int ty = preview.kind == CARD_CHIQUITA ? actorEnemyBackRow(seat) : (preview.kind == CARD_CUT ? actorEnemyMidRow(seat) : actorEnemyFrontRow(seat));
+      int cx = BOARD_OX + viewBoardX(ballX) * BOARD_CELL_W + (BOARD_CELL_W / 2);
+      int cy = BOARD_OY + viewBoardY(ty) * BOARD_CELL_H + (BOARD_CELL_H / 2);
+      drawPreviewDot(cx, cy);
+    }
+    return;
+  }
 
   uint8_t seat = actorSeat(actorIsPlayer);
   int signY = actorStepY(seat);
@@ -407,8 +688,15 @@ void drawLastPlayedCard(const Card &c, int x, int y, bool invert)
   if (invert)
     display.fillRect(x, y, 14, 10, SSD1306_WHITE);
   display.drawRect(x, y, 14, 10, SSD1306_WHITE);
-  drawDirectionGlyphColor(viewCardDir(c.dir), x + 4, y + 4, fg);
-  drawCardNumberGlyphColor(c.value, x + 9, y + 3, fg);
+  if (isSpecialCard(c))
+  {
+    drawSpecialCardLabel(c, x + 1, y + 2, fg);
+  }
+  else
+  {
+    drawDirectionGlyphColor(viewCardDir(c.dir), x + 4, y + 4, fg);
+    drawCardNumberGlyphColor(c.value, x + 9, y + 3, fg);
+  }
 }
 
 void toneMs(int freq, int ms)
@@ -572,7 +860,7 @@ struct __attribute__((packed)) TwoPMessage
   uint8_t servePos;
   uint8_t dir;
   uint8_t value;
-  uint8_t reserved;
+  uint8_t kind;
 };
 
 static volatile bool gTwoPPacketReady = false;
@@ -641,7 +929,9 @@ int findMatchingCardIndex(Card hand[], const Card &c)
 {
   for (int i = 0; i < HAND_SIZE; ++i)
   {
-    if (!hand[i].used && hand[i].dir == c.dir && hand[i].value == c.value)
+    if (hand[i].used || hand[i].kind != c.kind)
+      continue;
+    if (isSpecialCard(c) || (hand[i].dir == c.dir && hand[i].value == c.value))
       return i;
   }
   return -1;
@@ -670,11 +960,11 @@ int firstUsableIndex(Card hand[])
   return -1;
 }
 
-bool hasServeValue(Card hand[])
+bool hasPlayableServeCard(Card hand[])
 {
   for (int i = 0; i < HAND_SIZE; ++i)
   {
-    if (hand[i].value >= 3)
+    if (!isSpecialCard(hand[i]) && hand[i].value >= 3)
       return true;
   }
   return false;
@@ -684,10 +974,27 @@ void dealHands()
 {
   while (true)
   {
-    int order[15];
-    for (int i = 0; i < 15; ++i)
+    Card roundDeck[ROUND_DECK_SIZE];
+    for (int i = 0; i < BASIC_DECK_SIZE; ++i)
+      roundDeck[i] = kBasicDeck[i];
+
+    int specialOrder[SPECIAL_POOL_SIZE];
+    for (int i = 0; i < SPECIAL_POOL_SIZE; ++i)
+      specialOrder[i] = i;
+    for (int i = SPECIAL_POOL_SIZE - 1; i > 0; --i)
+    {
+      int j = random(i + 1);
+      int t = specialOrder[i];
+      specialOrder[i] = specialOrder[j];
+      specialOrder[j] = t;
+    }
+    for (int i = 0; i < SPECIALS_PER_GAME; ++i)
+      roundDeck[BASIC_DECK_SIZE + i] = kSpecialPool[specialOrder[i]];
+
+    int order[ROUND_DECK_SIZE];
+    for (int i = 0; i < ROUND_DECK_SIZE; ++i)
       order[i] = i;
-    for (int i = 14; i > 0; --i)
+    for (int i = ROUND_DECK_SIZE - 1; i > 0; --i)
     {
       int j = random(i + 1);
       int t = order[i];
@@ -696,8 +1003,8 @@ void dealHands()
     }
     for (int i = 0; i < HAND_SIZE; ++i)
     {
-      Card seat0 = kDeck[order[i]];
-      Card seat1 = kDeck[order[i + HAND_SIZE]];
+      Card seat0 = roundDeck[order[i]];
+      Card seat1 = roundDeck[order[i + HAND_SIZE]];
       if (gameMode == MODE_2P && localSeat == 1)
       {
         playerHand[i] = seat1;
@@ -708,12 +1015,12 @@ void dealHands()
         playerHand[i] = seat0;
         cpuHand[i] = seat1;
       }
-      playerHand[i].used = false;
-      cpuHand[i].used = false;
+      resetDealtCard(playerHand[i]);
+      resetDealtCard(cpuHand[i]);
     }
 
     Card *serveHand = playerServe ? playerHand : cpuHand;
-    if (hasServeValue(serveHand))
+    if (hasPlayableServeCard(serveHand))
       return;
   }
 }
@@ -827,7 +1134,7 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
   {
     if (msg.turnIndex != turnCount)
       return;
-    Card c{(CardDir)msg.dir, msg.value, false};
+    Card c{(CardKind)msg.kind, (CardDir)msg.dir, msg.value, false};
     int idx = findMatchingCardIndex(cpuHand, c);
     if (idx < 0)
       idx = firstUsableIndex(cpuHand);
@@ -1031,6 +1338,7 @@ void twoPSendCard(const Card &c)
   msg.turnIndex = turnCount;
   msg.dir = (uint8_t)c.dir;
   msg.value = c.value;
+  msg.kind = (uint8_t)c.kind;
   twoPSendMessage(twoPPeerMac, msg);
 }
 
@@ -1067,7 +1375,8 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
     syncTwoPViewState();
     Serial.printf("[2P] deal localSeat=%u server=%u turn=%u firstCard=%s%u\n",
                   localSeat, serverSeat, turnSeat,
-                  dirLabel(playerHand[0].dir), playerHand[0].value);
+                  isSpecialCard(playerHand[0]) ? cardKindLabel(playerHand[0].kind) : dirLabel(playerHand[0].dir),
+                  playerHand[0].value);
   }
   else
   {
@@ -1081,6 +1390,61 @@ void resetGame(bool keepServer, uint32_t nowMs, FrameEffects &fx)
 bool applyCard(bool actorIsPlayer, const Card &c, bool animate)
 {
   uint8_t seat = actorSeat(actorIsPlayer);
+
+  if (isSpecialCard(c))
+  {
+    if (!specialCardAvailable(actorIsPlayer, c))
+      return false;
+
+    int tx = ballX;
+    int ty = ballY;
+    if (c.kind == CARD_DROP || c.kind == CARD_COUNTER)
+    {
+      int signY = actorStepY(seat);
+      int dx = actorStepX(seat, c.dir);
+      tx = ballX + dx * c.value;
+      ty = ballY + signY * c.value;
+    }
+    else if (c.kind == CARD_CHIQUITA)
+    {
+      ty = actorEnemyBackRow(seat);
+    }
+    else if (c.kind == CARD_CUT)
+    {
+      ty = actorEnemyMidRow(seat);
+    }
+    else if (c.kind == CARD_NET_IN)
+    {
+      ty = actorEnemyFrontRow(seat);
+    }
+
+    if (!boardContains(tx, ty) || !targetReachedOpponentSide(seat, ty))
+      return false;
+
+    if (animate)
+    {
+      while (ballX != tx || ballY != ty)
+      {
+        if (ballX < tx)
+          ballX++;
+        else if (ballX > tx)
+          ballX--;
+        if (ballY < ty)
+          ballY++;
+        else if (ballY > ty)
+          ballY--;
+        renderGame(g, display);
+        delay(BALL_STEP_ANIM_MS);
+      }
+    }
+    else
+    {
+      ballX = (int8_t)tx;
+      ballY = (int8_t)ty;
+    }
+    return true;
+  }
+
   int signY = actorStepY(seat);
   int dx = actorStepX(seat, c.dir);
   bool out = false;
@@ -1216,6 +1580,18 @@ void drawBoard()
     drawCardTargetPreview(true, playerHand[cardCursor]);
   }
 
+  if (phase == PHASE_SPECIAL_TARGET)
+  {
+    for (uint8_t i = 0; i < specialTargetCount; ++i)
+    {
+      int cx = ox + viewBoardX(specialTargetX[i]) * cellW + (cellW / 2);
+      int cy = oy + viewBoardY(specialTargetY[i]) * cellH + (cellH / 2);
+      if (i == specialTargetCursor)
+        display.drawCircle(cx, cy, 3, SSD1306_WHITE);
+      drawPreviewDot(cx, cy);
+    }
+  }
+
   if (phase == PHASE_SERVE_POS)
   {
     int sx = ox + viewBoardX(serveX) * cellW;
@@ -1232,23 +1608,37 @@ void drawBoard()
 void drawHand(Card hand[], bool showCursor)
 {
   int x = 57;
-  int y = 40;
-  const int cardW = 11;
-  const int cardH = 18;
-  const int gapX = 1;
+  int y = 37;
+  const int cardW = 14;
+  const int cardH = 11;
+  const int gapX = 2;
+  const int gapY = 2;
+  const int cardsPerRow = 4;
   display.setTextSize(1);
   for (int i = 0; i < HAND_SIZE; ++i)
   {
-    int cx = x + i * (cardW + gapX);
-    int cy = y;
+    int cx = x + (i % cardsPerRow) * (cardW + gapX);
+    int cy = y + (i / cardsPerRow) * (cardH + gapY);
     if (hand[i].used)
       continue;
-    display.drawRect(cx, cy, cardW, cardH, SSD1306_WHITE);
+    bool disabledSpecial = isSpecialCard(hand[i]) &&
+                           (phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD) &&
+                           !specialCardAvailable(true, hand[i]);
+    if (disabledSpecial)
+      display.fillRect(cx, cy, cardW, cardH, SSD1306_WHITE);
+    else
+      display.drawRect(cx, cy, cardW, cardH, SSD1306_WHITE);
     if (showCursor && i == cardCursor)
       display.drawRect(cx - 1, cy - 1, cardW + 2, cardH + 2, SSD1306_WHITE);
-    // Vertical layout: direction on top, value below.
-    drawDirectionGlyph(viewCardDir(hand[i].dir), cx + 5, cy + 5);
-    drawCardNumberGlyph(hand[i].value, cx + 4, cy + 12);
+    if (isSpecialCard(hand[i]))
+    {
+      drawSpecialCardLabel(hand[i], cx + 1, cy + 2, disabledSpecial ? SSD1306_BLACK : SSD1306_WHITE);
+    }
+    else
+    {
+      drawDirectionGlyph(viewCardDir(hand[i].dir), cx + 4, cy + 5);
+      drawCardNumberGlyph(hand[i].value, cx + 9, cy + 3);
+    }
   }
 }
 
@@ -1358,13 +1748,18 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
       display.setCursor(104, TOP_LABEL_Y);
       display.print(localName());
     }
+    else if (phase == PHASE_SPECIAL_TARGET)
+    {
+      display.setCursor(96, TOP_LABEL_Y);
+      display.print("Target");
+    }
     if (phase == PHASE_GAME_OVER)
     {
       display.setCursor(54, 10);
       display.print("ROUND END");
     }
     // Keep the local hand visible, but only show the cursor on the local turn.
-    drawHand(playerHand, phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD);
+    drawHand(playerHand, phase == PHASE_SERVE_CARD || phase == PHASE_PLAYER_CARD || phase == PHASE_SPECIAL_TARGET);
   }
   display.display();
 }
@@ -1379,12 +1774,9 @@ void moveCursorLR(int delta, Card hand[])
   }
 }
 
-void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
+void finishPlayerCard(Card c, uint32_t nowMs, FrameEffects &fx)
 {
-  if (playerHand[cardCursor].used)
-    return;
-  Card c = playerHand[cardCursor];
-  playerHand[cardCursor].used = true;
+  playerHand[pendingHandIndex].used = true;
   lastPlayerCard = c;
   twoPSendCard(c);
   sfxAttack();
@@ -1411,7 +1803,36 @@ void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
   }
   phase = PHASE_CPU_CARD;
   phaseStartedAt = nowMs;
-  cpuActionDelayMs = randomCpuDelayMs();
+  if (gameMode == MODE_CPU)
+    cpuActionDelayMs = randomCpuDelayMs();
+}
+
+void pickAndApplyPlayerCard(uint32_t nowMs, FrameEffects &fx)
+{
+  if (playerHand[cardCursor].used)
+    return;
+  Card c = playerHand[cardCursor];
+  if (isSpecialCard(c))
+  {
+    if (!specialCardAvailable(true, c))
+    {
+      emitSound(fx, SFX_MISS_EVT);
+      return;
+    }
+    if (cardNeedsTargetChoice(c))
+    {
+      pendingCard = c;
+      pendingHandIndex = cardCursor;
+      pendingReturnPhase = phase;
+      buildSpecialTargets(true, c);
+      phase = PHASE_SPECIAL_TARGET;
+      specialTargetCursor = 0;
+      emitSound(fx, SFX_CONFIRM_EVT);
+      return;
+    }
+  }
+  pendingHandIndex = cardCursor;
+  finishPlayerCard(c, nowMs, fx);
 }
 
 void cpuPlay(uint32_t nowMs, FrameEffects &fx)
@@ -1421,26 +1842,40 @@ void cpuPlay(uint32_t nowMs, FrameEffects &fx)
     awardRound(true, nowMs, fx);
     return;
   }
-  int idx = firstUsableIndex(cpuHand);
+  int idx = -1;
+  Card selected{CARD_BASIC, STRAIGHT, 0, true};
   for (int i = 0; i < HAND_SIZE; ++i)
   {
     if (!cpuHand[i].used)
     {
-      // Pick first legal, fallback first unused.
+      // Pick first legal, fallback first playable.
       Card test = cpuHand[i];
+      if (!prepareAutomaticCard(false, test))
+        continue;
+      if (idx < 0)
+      {
+        idx = i;
+        selected = test;
+      }
       int8_t bx = ballX, by = ballY;
       if (applyCard(false, test, false))
       {
         ballX = bx;
         ballY = by;
         idx = i;
+        selected = test;
         break;
       }
       ballX = bx;
       ballY = by;
     }
   }
-  Card c = cpuHand[idx];
+  if (idx < 0)
+  {
+    awardRound(true, nowMs, fx);
+    return;
+  }
+  Card c = selected;
   cpuHand[idx].used = true;
   lastCpuCard = c;
   bool ok = applyCard(false, c);
@@ -1612,6 +2047,40 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
       if (in.upPressed)
         pickAndApplyPlayerCard(nowMs, fx);
       if (TURN_LIMIT_ENABLED && phase == PHASE_PLAYER_CARD && nowMs - phaseStartedAt >= TURN_LIMIT_MS)
+      {
+        awardRound(false, nowMs, fx);
+      }
+    }
+  }
+  else if (phase == PHASE_SPECIAL_TARGET)
+  {
+    if (specialTargetCount == 0)
+    {
+      phase = pendingReturnPhase;
+    }
+    else
+    {
+      if (in.leftPressed)
+      {
+        specialTargetCursor = (specialTargetCursor + specialTargetCount - 1) % specialTargetCount;
+        emitSound(fx, SFX_CLICK_EVT);
+      }
+      if (in.rightPressed)
+      {
+        specialTargetCursor = (specialTargetCursor + 1) % specialTargetCount;
+        emitSound(fx, SFX_CLICK_EVT);
+      }
+      if (in.downPressed)
+      {
+        phase = pendingReturnPhase;
+        emitSound(fx, SFX_CLICK_EVT);
+      }
+      if (in.upPressed)
+      {
+        Card c = selectedSpecialTargetCard(pendingCard, specialTargetCursor);
+        finishPlayerCard(c, nowMs, fx);
+      }
+      if (TURN_LIMIT_ENABLED && pendingReturnPhase == PHASE_PLAYER_CARD && nowMs - phaseStartedAt >= TURN_LIMIT_MS)
       {
         awardRound(false, nowMs, fx);
       }
