@@ -21,10 +21,13 @@ static const int ROUND_DECK_SIZE = BASIC_DECK_SIZE + SPECIALS_PER_GAME;
 static const uint32_t TURN_LIMIT_MS = 30000;
 static const bool TURN_LIMIT_ENABLED = true;
 static const uint32_t TITLE_MIN_SHOW_MS = 800;
+static const uint32_t TABLE_FULL_SHOW_MS = 1500;
+static const uint32_t TWO_P_BUSY_INTERVAL_MS = 500;
 static const uint32_t BALL_STEP_ANIM_MS = 120;
 static const int TOP_INFO_Y = 14;
 static const int TOP_LABEL_Y = 3;
 static const uint8_t NEO_LEVEL = 32;
+static const uint8_t TWO_P_TABLE_COUNT = 3;
 
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
 Adafruit_NeoPixel pixels(NUM_LEDS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
@@ -55,7 +58,9 @@ struct Card
 enum Phase
 {
   PHASE_TITLE,
+  PHASE_2P_TABLE_SELECT,
   PHASE_2P_WAIT,
+  PHASE_2P_TABLE_FULL,
   PHASE_GAME_INTRO,
   PHASE_SERVE_POS,
   PHASE_SERVE_CARD,
@@ -114,6 +119,8 @@ struct GameContext
   uint8_t localSeat = 0;
   uint8_t serverSeat = 0;
   uint8_t turnSeat = 0;
+  uint8_t twoPTableCursor = 0;
+  uint8_t twoPSelectedTable = 0;
   bool twoPNetReady = false;
   bool twoPConnected = false;
   bool twoPSessionActive = false;
@@ -122,6 +129,7 @@ struct GameContext
   uint32_t twoPLocalNonce = 0;
   uint32_t twoPLastHelloAt = 0;
   uint32_t twoPLastStartAt = 0;
+  uint32_t twoPLastBusyAt = 0;
   uint8_t twoPPeerMac[6] = {0, 0, 0, 0, 0, 0};
   uint32_t twoPPeerNonce = 0;
   Card lastPlayerCard{CARD_BASIC, STRAIGHT, 0, true};
@@ -199,6 +207,8 @@ uint32_t randomCpuDelayMs();
 #define localSeat g.localSeat
 #define serverSeat g.serverSeat
 #define turnSeat g.turnSeat
+#define twoPTableCursor g.twoPTableCursor
+#define twoPSelectedTable g.twoPSelectedTable
 #define twoPNetReady g.twoPNetReady
 #define twoPConnected g.twoPConnected
 #define twoPSessionActive g.twoPSessionActive
@@ -207,6 +217,7 @@ uint32_t randomCpuDelayMs();
 #define twoPLocalNonce g.twoPLocalNonce
 #define twoPLastHelloAt g.twoPLastHelloAt
 #define twoPLastStartAt g.twoPLastStartAt
+#define twoPLastBusyAt g.twoPLastBusyAt
 #define twoPPeerMac g.twoPPeerMac
 #define twoPPeerNonce g.twoPPeerNonce
 #define lastPlayerCard g.lastPlayerCard
@@ -845,12 +856,14 @@ enum TwoPMsgType : uint8_t
   TWO_P_ACK = 3,
   TWO_P_SERVE_POS = 4,
   TWO_P_CARD = 5,
-  TWO_P_ROUND_RESULT = 6
+  TWO_P_ROUND_RESULT = 6,
+  TWO_P_BUSY = 7
 };
 
 struct __attribute__((packed)) TwoPMessage
 {
   uint8_t type;
+  uint8_t tableId;
   uint8_t seatId;
   uint8_t serverId;
   uint8_t turnId;
@@ -906,6 +919,8 @@ const char *twoPMsgName(uint8_t type)
     return "CARD";
   case TWO_P_ROUND_RESULT:
     return "ROUND_RESULT";
+  case TWO_P_BUSY:
+    return "BUSY";
   default:
     return "UNKNOWN";
   }
@@ -1035,6 +1050,21 @@ void twoPSendMessage(const uint8_t *mac, const TwoPMessage &msg)
   Serial.println();
 }
 
+bool twoPTableMatches(const TwoPMessage &msg)
+{
+  return twoPSelectedTable > 0 && msg.tableId == twoPSelectedTable;
+}
+
+void twoPSendBusy()
+{
+  TwoPMessage msg = {};
+  msg.type = TWO_P_BUSY;
+  msg.tableId = twoPSelectedTable;
+  twoPSendMessage(kBroadcastMac, msg);
+}
+
+void twoPShutdownNetwork();
+
 void twoPEnsurePeer(const uint8_t *mac)
 {
   if (esp_now_is_peer_exist(mac))
@@ -1076,16 +1106,42 @@ void twoPStartSession(uint32_t nowMs, FrameEffects &fx)
 
 void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs, FrameEffects &fx)
 {
+  if (!twoPTableMatches(msg))
+    return;
+
+  if (msg.type == TWO_P_BUSY)
+  {
+    if (!twoPSessionActive && phase == PHASE_2P_WAIT)
+    {
+      Serial.printf("[2P] table %u full\n", twoPSelectedTable);
+      twoPShutdownNetwork();
+      phase = PHASE_2P_TABLE_FULL;
+      phaseStartedAt = nowMs;
+      emitSound(fx, SFX_MISS_EVT);
+    }
+    return;
+  }
+
   if (msg.type == TWO_P_HELLO)
   {
+    if (twoPSessionActive)
+    {
+      twoPSendBusy();
+      return;
+    }
+    if (twoPConnected && !sameMac(mac, twoPPeerMac))
+      return;
     Serial.print("[2P] peer hello from=");
     twoPPrintMac(mac);
-    Serial.printf(" nonce=%lu\n", (unsigned long)msg.nonce);
+    Serial.printf(" table=%u nonce=%lu\n", msg.tableId, (unsigned long)msg.nonce);
     twoPPeerNonce = msg.nonce;
     twoPBindPeer(mac);
     Serial.printf("[2P] connected localSeat=%u leader=%u\n", localSeat, twoPLeader ? 1 : 0);
     return;
   }
+
+  if (twoPConnected && !sameMac(mac, twoPPeerMac))
+    return;
 
   if (msg.type == TWO_P_START)
   {
@@ -1101,6 +1157,7 @@ void twoPHandlePacket(const uint8_t *mac, const TwoPMessage &msg, uint32_t nowMs
     twoPStartSession(nowMs, fx);
     TwoPMessage ackMsg = {};
     ackMsg.type = TWO_P_ACK;
+    ackMsg.tableId = twoPSelectedTable;
     ackMsg.seed = twoPSessionSeed;
     twoPSendMessage(twoPPeerMac, ackMsg);
     return;
@@ -1199,6 +1256,12 @@ void twoPProcessNetwork(uint32_t nowMs, FrameEffects &fx)
                   badLen, badType, (unsigned)sizeof(TwoPMessage));
   }
 
+  if (twoPSessionActive && nowMs - twoPLastBusyAt >= TWO_P_BUSY_INTERVAL_MS)
+  {
+    twoPSendBusy();
+    twoPLastBusyAt = nowMs;
+  }
+
   if (phase != PHASE_2P_WAIT && !twoPSessionActive)
     return;
 
@@ -1206,6 +1269,7 @@ void twoPProcessNetwork(uint32_t nowMs, FrameEffects &fx)
   {
     TwoPMessage hello = {};
     hello.type = TWO_P_HELLO;
+    hello.tableId = twoPSelectedTable;
     hello.nonce = twoPLocalNonce;
     hello.seatId = localSeat;
     twoPSendMessage(kBroadcastMac, hello);
@@ -1223,6 +1287,7 @@ void twoPProcessNetwork(uint32_t nowMs, FrameEffects &fx)
     }
     TwoPMessage startMsg = {};
     startMsg.type = TWO_P_START;
+    startMsg.tableId = twoPSelectedTable;
     startMsg.seatId = localSeat;
     startMsg.serverId = serverSeat;
     startMsg.turnId = turnSeat;
@@ -1289,6 +1354,7 @@ void twoPInitNetwork(uint32_t nowMs)
   twoPLocalNonce = esp_random();
   twoPLastHelloAt = nowMs;
   twoPLastStartAt = 0;
+  twoPLastBusyAt = 0;
   localSeat = 0;
   serverSeat = 0;
   turnSeat = 0;
@@ -1324,6 +1390,7 @@ void twoPSendServePos(uint8_t sx)
     return;
   TwoPMessage msg = {};
   msg.type = TWO_P_SERVE_POS;
+  msg.tableId = twoPSelectedTable;
   msg.turnIndex = turnCount;
   msg.servePos = sx;
   twoPSendMessage(twoPPeerMac, msg);
@@ -1335,6 +1402,7 @@ void twoPSendCard(const Card &c)
     return;
   TwoPMessage msg = {};
   msg.type = TWO_P_CARD;
+  msg.tableId = twoPSelectedTable;
   msg.turnIndex = turnCount;
   msg.dir = (uint8_t)c.dir;
   msg.value = c.value;
@@ -1348,6 +1416,7 @@ void twoPSendRoundResult(uint8_t winnerSeat)
     return;
   TwoPMessage msg = {};
   msg.type = TWO_P_ROUND_RESULT;
+  msg.tableId = twoPSelectedTable;
   msg.seatId = winnerSeat;
   msg.turnIndex = turnCount;
   twoPSendMessage(twoPPeerMac, msg);
@@ -1676,12 +1745,37 @@ void renderGame(const GameContext &, Adafruit_SSD1306 &)
   else if (phase == PHASE_2P_WAIT)
   {
     display.setTextSize(1);
-    display.setCursor(18, 18);
+    display.setCursor(28, 10);
+    display.print("TABLE ");
+    display.print(twoPSelectedTable);
+    display.setCursor(18, 24);
     display.print("2P CONNECTING");
-    display.setCursor(18, 30);
+    display.setCursor(18, 36);
     display.print(twoPConnected ? "PEER FOUND" : "SEARCHING...");
-    display.setCursor(18, 44);
+    display.setCursor(18, 48);
     display.print(twoPSessionActive ? "READY" : "WAITING");
+  }
+  else if (phase == PHASE_2P_TABLE_SELECT)
+  {
+    display.setTextSize(1);
+    display.setCursor(24, 12);
+    display.print("SELECT TABLE");
+    for (uint8_t i = 0; i < TWO_P_TABLE_COUNT; ++i)
+    {
+      display.setCursor(18 + i * 36, 34);
+      display.print(twoPTableCursor == i ? ">" : " ");
+      display.print("T");
+      display.print(i + 1);
+    }
+  }
+  else if (phase == PHASE_2P_TABLE_FULL)
+  {
+    display.setTextSize(1);
+    display.setCursor(32, 20);
+    display.print("TABLE ");
+    display.print(twoPTableCursor + 1);
+    display.setCursor(34, 34);
+    display.print("FULL");
   }
   else if (phase == PHASE_GAME_INTRO)
   {
@@ -1961,11 +2055,59 @@ FrameEffects updateGame(GameContext &, const InputState &in, uint32_t nowMs)
       }
       else
       {
-        twoPInitNetwork(nowMs);
-        phase = PHASE_2P_WAIT;
+        twoPSelectedTable = 0;
+        phase = PHASE_2P_TABLE_SELECT;
         phaseStartedAt = nowMs;
         emitSound(fx, SFX_CONFIRM_EVT);
       }
+    }
+  }
+  else if (phase == PHASE_2P_TABLE_SELECT)
+  {
+    if (in.leftPressed)
+    {
+      twoPTableCursor = (twoPTableCursor + TWO_P_TABLE_COUNT - 1) % TWO_P_TABLE_COUNT;
+      emitSound(fx, SFX_CLICK_EVT);
+    }
+    if (in.rightPressed)
+    {
+      twoPTableCursor = (twoPTableCursor + 1) % TWO_P_TABLE_COUNT;
+      emitSound(fx, SFX_CLICK_EVT);
+    }
+    if (in.downPressed)
+    {
+      gameMode = MODE_CPU;
+      twoPSelectedTable = 0;
+      phase = PHASE_TITLE;
+      emitSound(fx, SFX_CLICK_EVT);
+    }
+    if (in.upPressed)
+    {
+      twoPSelectedTable = twoPTableCursor + 1;
+      twoPInitNetwork(nowMs);
+      phase = PHASE_2P_WAIT;
+      phaseStartedAt = nowMs;
+      emitSound(fx, SFX_CONFIRM_EVT);
+    }
+  }
+  else if (phase == PHASE_2P_TABLE_FULL)
+  {
+    if (nowMs - phaseStartedAt >= TABLE_FULL_SHOW_MS)
+    {
+      twoPSelectedTable = 0;
+      phase = PHASE_2P_TABLE_SELECT;
+      phaseStartedAt = nowMs;
+    }
+  }
+  else if (phase == PHASE_2P_WAIT)
+  {
+    if (in.downPressed)
+    {
+      twoPShutdownNetwork();
+      twoPSelectedTable = 0;
+      phase = PHASE_2P_TABLE_SELECT;
+      phaseStartedAt = nowMs;
+      emitSound(fx, SFX_CLICK_EVT);
     }
   }
   else if (phase == PHASE_GAME_INTRO)
